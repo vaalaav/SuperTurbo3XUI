@@ -20,11 +20,11 @@
 Подключитесь к чистому серверу **Ubuntu 24.04** или **26.04 LTS** под пользователем `root` и выполните:
 
 ~~~bash
-curl -fsSL [https://raw.githubusercontent.com/vaalaav/SuperTurbo3XUI/main/install-vps.sh](https://raw.githubusercontent.com/vaalaav/SuperTurbo3XUI/main/install-vps.sh) -o /root/install-vps.sh && bash /root/install-vps.sh
+curl -fsSL https://raw.githubusercontent.com/vaalaav/SuperTurbo3XUI/main/install-vps.sh -o /root/install-vps.sh && bash /root/install-vps.sh
 ~~~
 
-> > [!CAUTION]
-> **Требования: чистый VPS с 1+ CPU, 1+ GB RAM и заранее привязанным к IP-адресу сервера доменом (A-запись).**
+> [!CAUTION]
+> **Требования: чистый VPS и заранее привязанным к IP-адресу сервера доменом (A-запись).**
 
 ---
 
@@ -73,4 +73,4 @@ my3xui
 1. Запустите команду установки из раздела **Быстрый старт**.
 2. Укажите ваш **домен** и email для выпуска SSL-сертификата.
 3. Выберите вариант маскировки (локальная заглушка или свой URL) и подтвердите случайные логин и пароль панели.
-4. Дождитесь завершения настройки (~2–3 минуты) — в конце в терминале появятся ссылка на панель, данные для входа и готовая ссылка подписки для импорта
+4. Дождитесь завершения настройки (~2–3 минуты) — в конце в терминале появятся ссылка на панель, данные для входа и готовая ссылка подписки для импорта в клиент.
