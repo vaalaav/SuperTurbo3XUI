@@ -2,7 +2,8 @@
 set -eu
 
 # ============================================================================
-# Интерактивный установщик 3x-ui + Nginx Multi-SNI + Sysctl + Security Stack
+# Интерактивный установщик 3x-ui + Nginx HTTP/2 XHTTP + Security Stack
+# Инбаунды: VLESS-XHTTP-PacketUP + VLESS-XHTTP-StreamOne (с анти-ТСПУ обфускацией)
 # Поддержка: Ubuntu 24.04 / 26.04 LTS | Маска: iqubik/myfakesite / Reverse Proxy
 # Защита: UFW + Fail2Ban + CrowdSec + CyberOK_Skipa_ips + CLI-утилита my3xui
 # ============================================================================
@@ -35,7 +36,7 @@ fi
 
 clear
 echo -e "${BOLD}${CYAN}=================================================================${NC}"
-echo -e "${BOLD}   Установка 3x-ui + Nginx Multi-SNI + Security & CLI my3xui     ${NC}"
+echo -e "${BOLD}   Установка 3x-ui (XHTTP Packet-UP + Stream-One) + Security      ${NC}"
 echo -e "${BOLD}${CYAN}=================================================================${NC}\n"
 
 # 2. Интерактивный ввод параметров
@@ -49,14 +50,7 @@ done
 read -erp "2. Введите Email для Let's Encrypt [admin@${DOMAIN}]: " LE_EMAIL
 LE_EMAIL=${LE_EMAIL:-"admin@${DOMAIN}"}
 
-echo -e "\n3. SNI-домены для Reality (можно указать несколько через запятую):"
-read -erp "   [taxi.yandex.ru,www.amd.com,f1tv.formula1.com]: " REALITY_SNI_RAW
-REALITY_SNI_RAW=${REALITY_SNI_RAW:-"taxi.yandex.ru,www.amd.com,f1tv.formula1.com"}
-REALITY_SNI_CLEAN=$(echo "$REALITY_SNI_RAW" | LC_ALL=C tr -cd "a-zA-Z0-9.,-" | tr "A-Z" "a-z")
-IFS=',' read -ra SNI_ARRAY <<< "$REALITY_SNI_CLEAN"
-PRIMARY_SNI="${SNI_ARRAY[0]}"
-
-echo -e "\n4. Режим маскировки основного домена (${DOMAIN}):"
+echo -e "\n3. Режим маскировки основного домена (${DOMAIN}):"
 echo -e "   ${BOLD}[Enter]${NC} — Локальный портал-заглушка (iqubik/myfakesite, рекомендуется)"
 echo -e "   ${BOLD}[URL]${NC}   — Введите URL сайта для Reverse Proxy (например, https://example.org)"
 read -erp "   Ваш выбор [myfakesite]: " REVERSE_PROXY_URL
@@ -64,14 +58,14 @@ REVERSE_PROXY_URL=$(echo "$REVERSE_PROXY_URL" | tr -d '[:space:]')
 
 # Генерация случайных логина, пароля, портов (40000-56000) и секретных путей
 RAND_USER="u$(openssl rand -hex 5)"
-read -erp "5. Логин администратора 3x-ui [${RAND_USER}]: " PANEL_USER
+read -erp "4. Логин администратора 3x-ui [${RAND_USER}]: " PANEL_USER
 PANEL_USER=${PANEL_USER:-"$RAND_USER"}
 
 RAND_PASS=$(openssl rand -hex 8)
-read -erp "6. Пароль администратора 3x-ui [${RAND_PASS}]: " PANEL_PASS
+read -erp "5. Пароль администратора 3x-ui [${RAND_PASS}]: " PANEL_PASS
 PANEL_PASS=${PANEL_PASS:-"$RAND_PASS"}
 
-echo -e "\n7. Блокировать IP/подсети сканеров CyberOK Skipa / ГРЧЦ / НКЦКИ на уровне nftables?"
+echo -e "\n6. Блокировать IP/подсети сканеров CyberOK Skipa / ГРЧЦ / НКЦКИ на уровне nftables?"
 read -erp "   (Рекомендуется, автообновление раз в сутки) [Y/n]: " ENABLE_SKIPA
 ENABLE_SKIPA=${ENABLE_SKIPA:-"Y"}
 
@@ -80,7 +74,6 @@ SUB_PORT=$(shuf -i 48001-56000 -n 1)
 PANEL_PATH=$(openssl rand -hex 9)
 SUB_PATH=$(openssl rand -hex 12)
 XHTTP_UP_PATH="media/ts/$(openssl rand -hex 4)"
-WS_PATH="media/ts/720/$(openssl rand -hex 4)"
 XHTTP_ONE_PATH="media/ts/1080/$(openssl rand -hex 4)"
 
 SSH_PORT=$(ss -tlnp 2>/dev/null | awk '/sshd|ssh\.socket/ {split($4,a,":"); print a[length(a)]; exit}')
@@ -91,7 +84,7 @@ SSH_PORT=${SSH_PORT:-22}
 
 echo -e "\n${YELLOW}Сводка параметров перед установкой:${NC}"
 echo "  • Домен:          ${DOMAIN}"
-echo "  • Reality SNI:    ${REALITY_SNI_CLEAN} (основной dest: ${PRIMARY_SNI})"
+echo "  • Протоколы:      VLESS-XHTTP-PacketUP + VLESS-XHTTP-StreamOne (анти-ТСПУ профиль)"
 echo "  • Маскировка:     ${REVERSE_PROXY_URL:-Локальный сайт iqubik/myfakesite}"
 echo "  • Порт панели:    127.0.0.1:${PANEL_PORT} (путь /${PANEL_PATH}/)"
 echo "  • Порт подписки:  127.0.0.1:${SUB_PORT} (путь /${SUB_PATH}/)"
@@ -281,18 +274,11 @@ n
 EOF
 systemctl stop x-ui
 
-log_info "Генерация ключей Reality и патчинг базы данных 3x-ui..."
+log_info "Генерация UUID и патчинг базы данных 3x-ui (XHTTP Packet-UP + Stream-One с обфускацией)..."
 XRAY_BIN=$(find /usr/local/x-ui/bin -name "xray-linux-*" | head -n 1)
 [[ -z "$XRAY_BIN" ]] && log_err "Бинарный файл Xray не найден в /usr/local/x-ui/bin!"
 
-KEYS_OUT=$("$XRAY_BIN" x25519)
-PRIVATE_KEY=$(echo "$KEYS_OUT" | awk '/Private/ {print $NF}')
-PUBLIC_KEY=$(echo "$KEYS_OUT" | awk '/Public|Password/ {print $NF}' | head -n 1)
-SHORT_ID=$(openssl rand -hex 8)
-
-UUID_REALITY=$("$XRAY_BIN" uuid)
 UUID_XHTTP_UP=$("$XRAY_BIN" uuid)
-UUID_WS=$("$XRAY_BIN" uuid)
 UUID_XHTTP_ONE=$("$XRAY_BIN" uuid)
 
 python3 - <<PYEOF
@@ -301,9 +287,6 @@ import sqlite3, json
 db_path = "/etc/x-ui/x-ui.db"
 conn = sqlite3.connect(db_path)
 cur = conn.cursor()
-
-sni_list = [s.strip() for s in "${REALITY_SNI_CLEAN}".split(",") if s.strip()]
-primary_sni = sni_list[0]
 
 settings_map = {
     "webPort": "${PANEL_PORT}",
@@ -330,66 +313,13 @@ for k, v in settings_map.items():
 
 cur.execute("DELETE FROM inbounds")
 
+browser_headers = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
+    "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7"
+}
+
 inbounds = [
-    {
-        "user_id": 1,
-        "up": 0,
-        "down": 0,
-        "total": 0,
-        "remark": "VLESS-Reality-MultiSNI",
-        "enable": 1,
-        "expiry_time": 0,
-        "listen": "127.0.0.1",
-        "port": 10443,
-        "protocol": "vless",
-        "settings": json.dumps({
-            "clients": [{
-                "id": "${UUID_REALITY}",
-                "flow": "xtls-rprx-vision",
-                "email": "reality_${DOMAIN}",
-                "limitIp": 0,
-                "totalGB": 0,
-                "expiryTime": 0,
-                "enable": True,
-                "subId": "main_sub"
-            }],
-            "decryption": "none",
-            "fallbacks": []
-        }),
-        "stream_settings": json.dumps({
-            "network": "tcp",
-            "security": "reality",
-            "externalProxy": [{
-                "forceTls": "same",
-                "dest": "${DOMAIN}",
-                "port": 443,
-                "remark": ""
-            }],
-            "realitySettings": {
-                "show": False,
-                "xver": 1,
-                "dest": f"{primary_sni}:443",
-                "serverNames": sni_list,
-                "privateKey": "${PRIVATE_KEY}",
-                "minClient": "",
-                "maxClient": "",
-                "maxTimediff": 0,
-                "shortIds": ["${SHORT_ID}"],
-                "settings": {
-                    "publicKey": "${PUBLIC_KEY}",
-                    "fingerprint": "chrome",
-                    "serverName": primary_sni,
-                    "spiderX": "/"
-                }
-            },
-            "tcpSettings": {
-                "acceptProxyProtocol": True,
-                "header": {"type": "none"}
-            }
-        }),
-        "tag": "inbound-reality-main",
-        "sniffing": json.dumps({"enabled": True, "destOverride": ["http", "tls", "quic"]})
-    },
+    # Inbound 1: VLESS XHTTP Packet-UP (127.0.0.1:11443)
     {
         "user_id": 1,
         "up": 0,
@@ -423,51 +353,20 @@ inbounds = [
             "xhttpSettings": {
                 "path": "/${XHTTP_UP_PATH}/",
                 "host": "${DOMAIN}",
-                "mode": "packet-up"
+                "mode": "packet-up",
+                "noGRPCHeader": True,
+                "xPaddingBytes": "100-1000",
+                "scMaxEachPostBytes": "500000-1000000",
+                "scMinPostsIntervalMs": "10-50",
+                "scMaxBufferedPosts": 30,
+                "scStreamUpServerSecs": "20-80",
+                "headers": browser_headers
             }
         }),
         "tag": "inbound-xhttp-up",
         "sniffing": json.dumps({"enabled": True, "destOverride": ["http", "tls", "quic"]})
     },
-    {
-        "user_id": 1,
-        "up": 0,
-        "down": 0,
-        "total": 0,
-        "remark": "VLESS-WS",
-        "enable": 1,
-        "expiry_time": 0,
-        "listen": "127.0.0.1",
-        "port": 9443,
-        "protocol": "vless",
-        "settings": json.dumps({
-            "clients": [{
-                "id": "${UUID_WS}",
-                "flow": "",
-                "email": "ws_${DOMAIN}",
-                "enable": True,
-                "subId": "main_sub"
-            }],
-            "decryption": "none"
-        }),
-        "stream_settings": json.dumps({
-            "network": "ws",
-            "security": "none",
-            "externalProxy": [{
-                "forceTls": "tls",
-                "dest": "${DOMAIN}",
-                "port": 443,
-                "remark": ""
-            }],
-            "wsSettings": {
-                "acceptProxyProtocol": False,
-                "path": "/${WS_PATH}/",
-                "headers": {"Host": "${DOMAIN}"}
-            }
-        }),
-        "tag": "inbound-ws",
-        "sniffing": json.dumps({"enabled": True, "destOverride": ["http", "tls", "quic"]})
-    },
+    # Inbound 2: VLESS XHTTP Stream-One (127.0.0.1:7443)
     {
         "user_id": 1,
         "up": 0,
@@ -501,7 +400,11 @@ inbounds = [
             "xhttpSettings": {
                 "path": "/${XHTTP_ONE_PATH}/",
                 "host": "${DOMAIN}",
-                "mode": "stream-one"
+                "mode": "stream-one",
+                "noGRPCHeader": True,
+                "xPaddingBytes": "100-1000",
+                "scStreamUpServerSecs": "30-120",
+                "headers": browser_headers
             }
         }),
         "tag": "inbound-xhttp-one",
@@ -522,13 +425,8 @@ PYEOF
 rm -f /usr/local/x-ui/bin/config.json
 /usr/local/x-ui/x-ui setting -username "${PANEL_USER}" -password "${PANEL_PASS}" -port "${PANEL_PORT}" -webBasePath "/${PANEL_PATH}/" >/dev/null
 
-# 9. Формирование /etc/nginx/nginx.conf
-SNI_MAP_LINES=""
-for sni in "${SNI_ARRAY[@]}"; do
-    [[ -n "$sni" ]] && SNI_MAP_LINES+="        ${sni}         127.0.0.1:10443;"$'\n'
-done
-
-log_info "Генерация /etc/nginx/nginx.conf с поддержкой Multi-SNI..."
+# 9. Формирование /etc/nginx/nginx.conf (прямой HTTP/2 на 443 порту)
+log_info "Генерация /etc/nginx/nginx.conf..."
 cat <<EOF > /etc/nginx/nginx.conf
 user www-data;
 worker_processes auto;
@@ -541,31 +439,6 @@ events {
     worker_connections 65535;
     multi_accept on;
     use epoll;
-}
-
-stream {
-    map \$ssl_preread_server_name \$backend_gate {
-        hostnames;
-        ${DOMAIN}              nginx_http_backend;
-${SNI_MAP_LINES}        default                nginx_http_backend;
-    }
-
-    upstream nginx_http_backend {
-        server unix:/dev/shm/nginx-http.sock;
-    }
-
-    server {
-        listen 443 backlog=65535 reuseport so_keepalive=75s:5s:3;
-        listen [::]:443 backlog=65535 reuseport so_keepalive=75s:5s:3;
-
-        proxy_timeout 1h;
-        proxy_connect_timeout 5s;
-        proxy_buffer_size 16k;
-        proxy_socket_keepalive on;
-        proxy_protocol on;
-        proxy_pass \$backend_gate;
-        ssl_preread on;
-    }
 }
 
 http {
@@ -582,32 +455,21 @@ http {
     resolver_timeout 5s;
     http2_recv_buffer_size 4m;
 
-    map \$proxy_protocol_addr \$ak_real_ip {
-        ""      \$remote_addr;
-        default \$proxy_protocol_addr;
-    }
-
-    map \$ak_real_ip \$limit_ip {
-        default \$ak_real_ip;
+    map \$remote_addr \$limit_ip {
+        default \$remote_addr;
     }
 
     upstream panel_3xui {
         server 127.0.0.1:${PANEL_PORT};
         keepalive 30;
     }
-    upstream xray_vless {
+    upstream xray_xhttp_up {
         server 127.0.0.1:11443;
         keepalive 64;
         keepalive_timeout 1h;
         keepalive_requests 100000;
     }
-    upstream xray_vless2 {
-        server 127.0.0.1:9443;
-        keepalive 64;
-        keepalive_timeout 1h;
-        keepalive_requests 100000;
-    }
-    upstream xray_vless3 {
+    upstream xray_xhttp_one {
         server 127.0.0.1:7443;
         keepalive 64;
         keepalive_timeout 1h;
@@ -617,7 +479,7 @@ http {
     proxy_cache_path /var/cache/nginx/img_cache levels=1:2 keys_zone=img_zone:10m max_size=1g inactive=7d use_temp_path=off;
     proxy_cache_path /var/cache/nginx/html_cache levels=1:2 keys_zone=html_zone:20m max_size=500m inactive=30d use_temp_path=off;
 
-    log_format main '\$ak_real_ip [\$time_local] "\$request" \$status \$body_bytes_sent "\$http_user_agent"';
+    log_format main '\$remote_addr [\$time_local] "\$request" \$status \$body_bytes_sent "\$http_user_agent"';
     access_log /var/log/nginx/access.log main buffer=32k flush=60s;
 
     keepalive_timeout 75s;
@@ -626,9 +488,6 @@ http {
     client_header_timeout 60s;
     send_timeout 60s;
     reset_timedout_connection on;
-    real_ip_header proxy_protocol;
-    set_real_ip_from 127.0.0.1;
-    set_real_ip_from unix:;
 
     client_max_body_size 8m;
     client_body_buffer_size 128k;
@@ -709,8 +568,10 @@ http {
         return 301 https://${DOMAIN}\$request_uri;
     }
 
+    # Защита от сканеров по IP-адресу сервера (сброс TLS handshake)
     server {
-        listen unix:/dev/shm/nginx-http.sock ssl default_server proxy_protocol;
+        listen 443 ssl default_server reuseport;
+        listen [::]:443 ssl default_server reuseport;
         server_name _;
 
         ssl_reject_handshake on;
@@ -721,7 +582,8 @@ http {
     }
 
     server {
-        listen unix:/dev/shm/nginx-http.sock ssl proxy_protocol;
+        listen 443 ssl;
+        listen [::]:443 ssl;
         http2 on;
         http2_max_concurrent_streams 1024;
         http2_chunk_size 16k;
@@ -755,6 +617,7 @@ http {
         proxy_intercept_errors on;
         error_page 400 403 404 405 @notfound;
 
+        # Панель 3x-ui
         location = /${PANEL_PATH} {
             return 301 /${PANEL_PATH}/;
         }
@@ -765,8 +628,8 @@ http {
             proxy_set_header Upgrade \$http_upgrade;
             proxy_set_header Connection \$connection_upgrade;
             proxy_set_header Host \$host;
-            proxy_set_header X-Real-IP \$ak_real_ip;
-            proxy_set_header X-Forwarded-For \$ak_real_ip;
+            proxy_set_header X-Real-IP \$remote_addr;
+            proxy_set_header X-Forwarded-For \$remote_addr;
             proxy_set_header X-Forwarded-Proto \$scheme;
             proxy_buffering off;
             proxy_request_buffering off;
@@ -774,30 +637,32 @@ http {
             add_header Cache-Control "no-store, no-cache, must-revalidate";
         }
 
+        # Единая подписка 3x-ui
         location ^~ /${SUB_PATH}/ {
             proxy_pass https://127.0.0.1:${SUB_PORT}/${SUB_PATH}/;
             proxy_ssl_verify off;
             proxy_http_version 1.1;
             proxy_set_header Host \$host;
-            proxy_set_header X-Real-IP \$ak_real_ip;
-            proxy_set_header X-Forwarded-For \$ak_real_ip;
+            proxy_set_header X-Real-IP \$remote_addr;
+            proxy_set_header X-Forwarded-For \$remote_addr;
             proxy_set_header Upgrade \$http_upgrade;
             proxy_set_header Connection \$connection_upgrade;
             add_header Cache-Control "no-store, no-cache, must-revalidate";
         }
 
+        # Inbound 1: VLESS XHTTP Packet-UP
         location /${XHTTP_UP_PATH}/ {
             set \$limit_ip "";
             if (\$ssl_early_data) { return 425; }
 
-            proxy_pass http://xray_vless;
+            proxy_pass http://xray_xhttp_up;
             proxy_http_version 2;
             proxy_buffering off;
             proxy_request_buffering off;
             gzip off;
             proxy_set_header Host \$host;
-            proxy_set_header X-Real-IP \$ak_real_ip;
-            proxy_set_header X-Forwarded-For \$ak_real_ip;
+            proxy_set_header X-Real-IP \$remote_addr;
+            proxy_set_header X-Forwarded-For \$remote_addr;
             proxy_set_header X-Forwarded-Proto \$scheme;
             proxy_read_timeout 1h;
             proxy_send_timeout 1h;
@@ -812,43 +677,19 @@ http {
             error_page 400 502 503 504 =404 @notfound;
         }
 
-        location /${WS_PATH}/ {
-            set \$limit_ip "";
-            if (\$ssl_early_data) { return 425; }
-
-            proxy_pass http://xray_vless2;
-            proxy_http_version 1.1;
-            proxy_set_header Upgrade \$http_upgrade;
-            proxy_set_header Connection \$connection_upgrade;
-            proxy_set_header Host \$host;
-            proxy_set_header X-Real-IP \$ak_real_ip;
-            proxy_set_header X-Forwarded-For \$ak_real_ip;
-            proxy_set_header X-Forwarded-Proto \$scheme;
-            proxy_buffering off;
-            proxy_request_buffering off;
-            gzip off;
-            proxy_socket_keepalive on;
-            proxy_read_timeout 1h;
-            proxy_send_timeout 1h;
-            send_timeout 1h;
-            client_max_body_size 0;
-            access_log off;
-            error_log /dev/null crit;
-            error_page 400 502 503 504 =404 @notfound;
-        }
-
+        # Inbound 2: VLESS XHTTP Stream-One
         location /${XHTTP_ONE_PATH}/ {
             set \$limit_ip "";
             if (\$ssl_early_data) { return 425; }
 
-            proxy_pass http://xray_vless3;
+            proxy_pass http://xray_xhttp_one;
             proxy_http_version 2;
             proxy_buffering off;
             proxy_request_buffering off;
             gzip off;
             proxy_set_header Host \$host;
-            proxy_set_header X-Real-IP \$ak_real_ip;
-            proxy_set_header X-Forwarded-For \$ak_real_ip;
+            proxy_set_header X-Real-IP \$remote_addr;
+            proxy_set_header X-Forwarded-For \$remote_addr;
             proxy_set_header X-Forwarded-Proto \$scheme;
             proxy_read_timeout 1h;
             proxy_send_timeout 1h;
@@ -1039,7 +880,7 @@ EOF
     log_ok "Блокировка CyberOK_Skipa_ips активирована."
 fi
 
-# 14. Установка CLI-утилиты my3xui (/usr/local/bin/my3xui) с прямым чтением БД
+# 14. Установка CLI-утилиты my3xui (/usr/local/bin/my3xui) с прямым чтением БД и поддержкой extra
 log_info "Установка CLI-утилиты управления my3xui..."
 cat <<'EOF' > /usr/local/bin/my3xui
 #!/usr/bin/env bash
@@ -1151,43 +992,27 @@ for row in cur.execute("SELECT remark, settings, stream_settings FROM inbounds W
 
     client = clients[0]
     uuid = client["id"]
-    flow = client.get("flow", "")
-    net = sst.get("network", "tcp")
-    sec = sst.get("security", "none")
+    net = sst.get("network", "xhttp")
+    xs = sst.get("xhttpSettings", {})
 
-    params = {"type": net, "encryption": "none"}
+    params = {
+        "type": net,
+        "encryption": "none",
+        "security": "tls",
+        "sni": domain,
+        "host": xs.get("host", domain),
+        "path": xs.get("path", "/"),
+        "mode": xs.get("mode", "auto"),
+        "fp": "randomized"
+    }
 
-    if sec == "reality":
-        rs = sst["realitySettings"]
-        params.update({
-            "security": "reality",
-            "pbk": rs["settings"]["publicKey"],
-            "fp": rs["settings"].get("fingerprint", "chrome"),
-            "sni": rs["serverNames"][0],
-            "sid": rs["shortIds"][0],
-            "spx": rs["settings"].get("spiderX", "/")
-        })
-        if flow:
-            params["flow"] = flow
-    elif net == "xhttp":
-        xs = sst["xhttpSettings"]
-        params.update({
-            "security": "tls",
-            "sni": domain,
-            "host": xs.get("host", domain),
-            "path": xs.get("path", "/"),
-            "mode": xs.get("mode", "auto"),
-            "fp": "chrome"
-        })
-    elif net == "ws":
-        ws = sst["wsSettings"]
-        params.update({
-            "security": "tls",
-            "sni": domain,
-            "host": ws.get("headers", {}).get("Host", domain),
-            "path": ws.get("path", "/"),
-            "fp": "chrome"
-        })
+    extra_keys = [
+        "noGRPCHeader", "xPaddingBytes", "scMaxEachPostBytes",
+        "scMinPostsIntervalMs", "scMaxBufferedPosts", "scStreamUpServerSecs", "headers"
+    ]
+    extra_obj = {k: xs[k] for k in extra_keys if k in xs}
+    if extra_obj:
+        params["extra"] = json.dumps(extra_obj, separators=(",", ":"))
 
     query_str = urllib.parse.urlencode(params, quote_via=urllib.parse.quote)
     link = f"vless://{uuid}@{domain}:443?{query_str}#{urllib.parse.quote(remark)}"
@@ -1306,6 +1131,7 @@ chmod 600 "$INFO_FILE"
 echo -e "\n${GREEN}${BOLD}=================================================================${NC}"
 echo -e "${GREEN}${BOLD}  УСТАНОВКА УСПЕШНО ЗАВЕРШЕНА!                                   ${NC}"
 echo -e "${GREEN}${BOLD}=================================================================${NC}"
+echo -e "  • Протоколы:     VLESS-XHTTP-PacketUP + VLESS-XHTTP-StreamOne (анти-ТСПУ)"
 echo -e "  • UFW:           активен (открыты только SSH:${SSH_PORT}, 80, 443)"
 echo -e "  • Fail2Ban:      активен (sshd + nginx-botsearch через nftables)"
 echo -e "  • CrowdSec:      активен (crowdsec + nftables firewall bouncer)"
