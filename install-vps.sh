@@ -4,6 +4,7 @@ set -eu
 # ============================================================================
 # Интерактивный установщик 3x-ui + Nginx HTTP/2 XHTTP + Security Stack
 # Инбаунды: XHTTP Packet-UP + Stream-One (авто-флаг и страна + анти-ТСПУ)
+# Маршрутизация: блокировка BitTorrent, Private IPs, Ads, Malware/Phishing
 # Поддержка: Ubuntu 24.04 / 26.04 LTS | Маска: iqubik/myfakesite / Reverse Proxy
 # Защита: UFW + Fail2Ban + CrowdSec + C24Be AS_Network_List + CyberOK_Skipa_ips
 # ============================================================================
@@ -95,6 +96,7 @@ SSH_PORT=${SSH_PORT:-22}
 echo -e "\n${YELLOW}Сводка параметров перед установкой:${NC}"
 echo "  • Домен:          ${DOMAIN}"
 echo "  • Протоколы:      XHTTP Packet-UP (#1) + XHTTP Stream-One (#2) [авто-флаг + страна]"
+echo "  • Роутинг Xray:   Блокировка BitTorrent, Private IPs, Ads, Malware/Phishing"
 echo "  • Маскировка:     ${REVERSE_PROXY_URL:-Локальный сайт iqubik/myfakesite}"
 echo "  • Порт панели:    127.0.0.1:${PANEL_PORT} (путь /${PANEL_PATH}/)"
 echo "  • Порт подписки:  127.0.0.1:${SUB_PORT} (путь /${SUB_PATH}/)"
@@ -284,7 +286,7 @@ n
 EOF
 systemctl stop x-ui
 
-log_info "Определение геолокации IP сервера, генерация UUID и патчинг базы 3x-ui..."
+log_info "Определение геолокации IP сервера, генерация UUID, настройка роутинга и патчинг базы 3x-ui..."
 XRAY_BIN=$(find /usr/local/x-ui/bin -name "xray-linux-*" | head -n 1)
 [[ -z "$XRAY_BIN" ]] && log_err "Бинарный файл Xray не найден в /usr/local/x-ui/bin!"
 
@@ -292,7 +294,7 @@ UUID_XHTTP_UP=$("$XRAY_BIN" uuid)
 UUID_XHTTP_ONE=$("$XRAY_BIN" uuid)
 
 python3 - <<PYEOF
-import sqlite3, json, urllib.request
+import sqlite3, json, urllib.request, os
 
 def detect_server_country():
     country_names_ru = {
@@ -357,6 +359,7 @@ base_remark = detect_server_country()
 print(f"Определено базовое имя локации: {base_remark}")
 
 db_path = "/etc/x-ui/x-ui.db"
+bin_dir = "/usr/local/x-ui/bin"
 conn = sqlite3.connect(db_path)
 cur = conn.cursor()
 
@@ -382,6 +385,53 @@ for k, v in settings_map.items():
         cur.execute("UPDATE settings SET value = ? WHERE key = ?", (v, k))
     else:
         cur.execute("INSERT INTO settings (key, value) VALUES (?, ?)", (k, v))
+
+# Настройка маршрутизации Xray: блокировка BitTorrent, Private IPs, Ads, Malware/Phishing/Cryptominers
+row = cur.execute("SELECT value FROM settings WHERE key = 'xrayTemplateConfig'").fetchone()
+tpl = json.loads(row[0]) if row and row[0] else {}
+
+tpl["outbounds"] = [
+    {"tag": "direct", "protocol": "freedom", "settings": {}},
+    {"tag": "blocked", "protocol": "blackhole", "settings": {}}
+]
+
+domain_blocks = ["geosite:category-ads-all"]
+if os.path.exists(os.path.join(bin_dir, "geosite_RU.dat")):
+    domain_blocks.append("ext:geosite_RU.dat:category-ads-all")
+if os.path.exists(os.path.join(bin_dir, "geosite_IR.dat")):
+    domain_blocks.extend([
+        "ext:geosite_IR.dat:malware",
+        "ext:geosite_IR.dat:phishing",
+        "ext:geosite_IR.dat:cryptominers",
+        "ext:geosite_IR.dat:category-ads-all"
+    ])
+
+tpl["routing"] = {
+    "domainStrategy": "AsIs",
+    "rules": [
+        {
+            "type": "field",
+            "outboundTag": "blocked",
+            "protocol": ["bittorrent"]
+        },
+        {
+            "type": "field",
+            "outboundTag": "blocked",
+            "ip": ["geoip:private"]
+        },
+        {
+            "type": "field",
+            "outboundTag": "blocked",
+            "domain": domain_blocks
+        }
+    ]
+}
+
+tpl_val = json.dumps(tpl, indent=2)
+if row:
+    cur.execute("UPDATE settings SET value = ? WHERE key = 'xrayTemplateConfig'", (tpl_val,))
+else:
+    cur.execute("INSERT INTO settings (key, value) VALUES ('xrayTemplateConfig', ?)", (tpl_val,))
 
 cur.execute("DELETE FROM inbounds")
 
@@ -1287,6 +1337,7 @@ echo -e "\n${GREEN}${BOLD}======================================================
 echo -e "${GREEN}${BOLD}  УСТАНОВКА УСПЕШНО ЗАВЕРШЕНА!                                   ${NC}"
 echo -e "${GREEN}${BOLD}=================================================================${NC}"
 echo -e "  • Протоколы:     XHTTP Packet-UP (#1) + XHTTP Stream-One (#2) [анти-ТСПУ]"
+echo -e "  • Роутинг Xray:  блокировка BitTorrent, Private IPs, Ads, Malware/Phishing"
 echo -e "  • UFW:           активен (открыты только SSH:${SSH_PORT}, 80, 443)"
 echo -e "  • Fail2Ban:      активен (sshd + nginx-botsearch через nftables)"
 echo -e "  • CrowdSec:      активен (crowdsec + nftables firewall bouncer)"
