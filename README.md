@@ -24,7 +24,7 @@ curl -fsSL https://raw.githubusercontent.com/vaalaav/SuperTurbo3XUI/main/install
 ~~~
 
 > [!CAUTION]
-> **Требования: чистый VPS и заранее привязанным к IP-адресу сервера доменом (A-запись).**
+> **Требования: чистый VPS и заранее привязанный к IP-адресу сервера домен (A-запись).**
 
 ---
 
