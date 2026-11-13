@@ -3,7 +3,7 @@ set -eu
 
 # ============================================================================
 # Интерактивный установщик 3x-ui + Nginx HTTP/2 XHTTP + Security Stack
-# Инбаунды: XHTTP Packet-UP + Stream-One (авто-флаг и страна + анти-ТСПУ)
+# Инбаунды: XHTTP Packet-UP ("Мобилы") + Stream-One ("Домашний") + анти-ТСПУ
 # Маршрутизация: блокировка BitTorrent, Private IPs, Ads, Malware/Phishing
 # Поддержка: Ubuntu 24.04 / 26.04 LTS | Маска: iqubik/myfakesite / Reverse Proxy
 # Защита: UFW + Fail2Ban + CrowdSec + C24Be AS_Network_List + CyberOK_Skipa_ips
@@ -95,7 +95,7 @@ SSH_PORT=${SSH_PORT:-22}
 
 echo -e "\n${YELLOW}Сводка параметров перед установкой:${NC}"
 echo "  • Домен:          ${DOMAIN}"
-echo "  • Протоколы:      XHTTP Packet-UP (#1) + XHTTP Stream-One (#2) [авто-флаг + страна]"
+echo "  • Протоколы:      XHTTP Packet-UP («Мобилы») + XHTTP Stream-One («Домашний»)"
 echo "  • Роутинг Xray:   Блокировка BitTorrent, Private IPs, Ads, Malware/Phishing"
 echo "  • Маскировка:     ${REVERSE_PROXY_URL:-Локальный сайт iqubik/myfakesite}"
 echo "  • Порт панели:    127.0.0.1:${PANEL_PORT} (путь /${PANEL_PATH}/)"
@@ -441,13 +441,13 @@ browser_headers = {
 }
 
 inbounds = [
-    # Inbound 1: VLESS XHTTP Packet-UP (127.0.0.1:11443)
+    # Inbound 1: VLESS XHTTP Packet-UP (127.0.0.1:11443) -> Мобилы
     {
         "user_id": 1,
         "up": 0,
         "down": 0,
         "total": 0,
-        "remark": f"{base_remark} 1",
+        "remark": f"{base_remark} - Мобилы",
         "enable": 1,
         "expiry_time": 0,
         "listen": "127.0.0.1",
@@ -488,13 +488,13 @@ inbounds = [
         "tag": "inbound-xhttp-up",
         "sniffing": json.dumps({"enabled": True, "destOverride": ["http", "tls", "quic"]})
     },
-    # Inbound 2: VLESS XHTTP Stream-One (127.0.0.1:7443)
+    # Inbound 2: VLESS XHTTP Stream-One (127.0.0.1:7443) -> Домашний
     {
         "user_id": 1,
         "up": 0,
         "down": 0,
         "total": 0,
-        "remark": f"{base_remark} 2",
+        "remark": f"{base_remark} - Домашний",
         "enable": 1,
         "expiry_time": 0,
         "listen": "127.0.0.1",
@@ -772,7 +772,7 @@ http {
             add_header Cache-Control "no-store, no-cache, must-revalidate";
         }
 
-        # Inbound 1: VLESS XHTTP Packet-UP
+        # Inbound 1: VLESS XHTTP Packet-UP (Мобилы)
         location /${XHTTP_UP_PATH}/ {
             set \$limit_ip "";
             if (\$ssl_early_data) { return 425; }
@@ -799,7 +799,7 @@ http {
             error_page 400 502 503 504 =404 @notfound;
         }
 
-        # Inbound 2: VLESS XHTTP Stream-One
+        # Inbound 2: VLESS XHTTP Stream-One (Домашний)
         location /${XHTTP_ONE_PATH}/ {
             set \$limit_ip "";
             if (\$ssl_early_data) { return 425; }
@@ -1336,7 +1336,7 @@ chmod 600 "$INFO_FILE"
 echo -e "\n${GREEN}${BOLD}=================================================================${NC}"
 echo -e "${GREEN}${BOLD}  УСТАНОВКА УСПЕШНО ЗАВЕРШЕНА!                                   ${NC}"
 echo -e "${GREEN}${BOLD}=================================================================${NC}"
-echo -e "  • Протоколы:     XHTTP Packet-UP (#1) + XHTTP Stream-One (#2) [анти-ТСПУ]"
+echo -e "  • Протоколы:     XHTTP Packet-UP («Мобилы») + XHTTP Stream-One («Домашний»)"
 echo -e "  • Роутинг Xray:  блокировка BitTorrent, Private IPs, Ads, Malware/Phishing"
 echo -e "  • UFW:           активен (открыты только SSH:${SSH_PORT}, 80, 443)"
 echo -e "  • Fail2Ban:      активен (sshd + nginx-botsearch через nftables)"
