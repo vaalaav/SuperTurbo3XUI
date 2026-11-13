@@ -5,7 +5,7 @@ set -eu
 # Интерактивный установщик 3x-ui + Nginx HTTP/2 XHTTP + Security Stack
 # Инбаунды: XHTTP Packet-UP + Stream-One (авто-флаг и страна + анти-ТСПУ)
 # Поддержка: Ubuntu 24.04 / 26.04 LTS | Маска: iqubik/myfakesite / Reverse Proxy
-# Защита: UFW + Fail2Ban + CrowdSec + CyberOK_Skipa_ips + CLI-утилита my3xui
+# Защита: UFW + Fail2Ban + CrowdSec + C24Be AS_Network_List + CyberOK_Skipa_ips
 # ============================================================================
 
 RED='\033[0;31m'
@@ -75,9 +75,9 @@ while True:
 read -erp "5. Пароль администратора 3x-ui [${RAND_PASS}]: " PANEL_PASS
 PANEL_PASS=${PANEL_PASS:-"$RAND_PASS"}
 
-echo -e "\n6. Блокировать IP/подсети сканеров CyberOK Skipa / ГРЧЦ / НКЦКИ на уровне nftables?"
-read -erp "   (Рекомендуется, автообновление раз в сутки) [Y/n]: " ENABLE_SKIPA
-ENABLE_SKIPA=${ENABLE_SKIPA:-"Y"}
+echo -e "\n6. Блокировать IP/подсети сканеров и госструктур РФ (C24Be AS_Network_List + CyberOK Skipa) в nftables?"
+read -erp "   (Рекомендуется, сжатие CIDR + автообновление раз в сутки; также управляемо через my3xui) [Y/n]: " ENABLE_SCANNERS_BLOCK
+ENABLE_SCANNERS_BLOCK=${ENABLE_SCANNERS_BLOCK:-"Y"}
 
 PANEL_PORT=$(shuf -i 40000-48000 -n 1)
 SUB_PORT=$(shuf -i 48001-56000 -n 1)
@@ -100,8 +100,8 @@ echo "  • Порт панели:    127.0.0.1:${PANEL_PORT} (путь /${PANEL
 echo "  • Порт подписки:  127.0.0.1:${SUB_PORT} (путь /${SUB_PATH}/)"
 echo "  • Логин панели:   ${PANEL_USER}"
 echo "  • Безопасность:   UFW (SSH:${SSH_PORT}, 80, 443) + Fail2Ban + CrowdSec"
-echo "  • CyberOK Skipa:  $([[ "$ENABLE_SKIPA" =~ ^[Yy]$ ]] && echo 'Включено (nftables)' || echo 'Отключено')"
-echo "  • CLI-утилита:    my3xui (инфо, чтение БД, crowdsec, полная очистка)"
+echo "  • Блок сканеров:  $([[ "$ENABLE_SCANNERS_BLOCK" =~ ^[Yy]$ ]] && echo 'C24Be + CyberOK Skipa (nftables)' || echo 'Отключено (доступно в my3xui)')"
+echo "  • CLI-утилита:    my3xui (info, creds, crowdsec, blocklist, clean)"
 echo ""
 read -erp "Начать установку? [Y/n]: " START_CONFIRM
 [[ "$START_CONFIRM" =~ ^[Nn]$ ]] && exit 0
@@ -860,10 +860,9 @@ sed -i "s|^mode:.*|mode: nftables|" /etc/crowdsec/bouncers/crowdsec-firewall-bou
 systemctl enable --now crowdsec crowdsec-firewall-bouncer
 systemctl restart crowdsec crowdsec-firewall-bouncer
 
-# 13. Интеграция CyberOK_Skipa_ips на уровне nftables (с автообновлением)
-if [[ "$ENABLE_SKIPA" =~ ^[Yy]$ ]]; then
-    log_info "Настройка блокировки сканеров CyberOK_Skipa_ips в nftables..."
-    cat <<'EOF' > /usr/local/sbin/update-skipa-blocklist.sh
+# 13. Подготовка генератора объединённой блокировки C24Be + CyberOK Skipa в nftables
+log_info "Подготовка модуля блокировки сканеров (C24Be AS_Network_List + CyberOK Skipa)..."
+cat <<'EOF' > /usr/local/sbin/update-scanners-blocklist.sh
 #!/usr/bin/env python3
 import os
 import re
@@ -871,41 +870,55 @@ import ipaddress
 import urllib.request
 import subprocess
 
-NFT_FILE = "/etc/nftables.d/skipa_block.nft"
+NFT_FILE = "/etc/nftables.d/scanners_block.nft"
 os.makedirs("/etc/nftables.d", exist_ok=True)
 
-urls = [
-    "https://raw.githubusercontent.com/tread-lightly/CyberOK_Skipa_ips/main/lists/cidr.txt",
-    "https://raw.githubusercontent.com/tread-lightly/CyberOK_Skipa_ips/main/README.md"
-]
+sources = {
+    "C24Be_AS_Network_List": [
+        "https://raw.githubusercontent.com/C24Be/AS_Network_List/main/blacklists/blacklist-v4.txt"
+    ],
+    "CyberOK_Skipa_ips": [
+        "https://raw.githubusercontent.com/tread-lightly/CyberOK_Skipa_ips/main/lists/cidr.txt",
+        "https://raw.githubusercontent.com/tread-lightly/CyberOK_Skipa_ips/main/README.md"
+    ]
+}
 
-raw_text = ""
-for u in urls:
-    try:
-        req = urllib.request.Request(u, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            raw_text += "\n" + resp.read().decode("utf-8", errors="ignore")
-    except Exception:
-        pass
-
-candidates = re.findall(r'\b(?:\d{1,3}\.){3}\d{1,3}(?:/\d{1,2})?\b', raw_text)
 valid_nets = set()
-for item in candidates:
-    try:
-        net = ipaddress.ip_network(item, strict=False)
-        if net.is_global:
-            valid_nets.add(str(net))
-    except ValueError:
-        continue
+stats = {}
 
-if len(valid_nets) < 10:
-    raise SystemExit("Error: too few valid IPs fetched, aborting update.")
+for name, urls in sources.items():
+    raw_text = ""
+    for u in urls:
+        try:
+            req = urllib.request.Request(u, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                raw_text += "\n" + resp.read().decode("utf-8", errors="ignore")
+        except Exception:
+            pass
 
-elements = ",\n        ".join(sorted(valid_nets))
-nft_config = f"""table inet skipa_block
-delete table inet skipa_block
+    candidates = re.findall(r'\b(?:\d{1,3}\.){3}\d{1,3}(?:/\d{1,2})?\b', raw_text)
+    source_nets = set()
+    for item in candidates:
+        try:
+            net = ipaddress.ip_network(item, strict=False)
+            if net.version == 4 and net.is_global and net.prefixlen >= 8:
+                source_nets.add(net)
+        except ValueError:
+            continue
+    stats[name] = len(source_nets)
+    valid_nets.update(source_nets)
 
-table inet skipa_block {{
+if len(valid_nets) < 500:
+    raise SystemExit(f"Error: too few valid CIDRs fetched ({len(valid_nets)}), aborting update.")
+
+collapsed = list(ipaddress.collapse_addresses(sorted(valid_nets)))
+elements = ",\n        ".join(str(net) for net in collapsed)
+
+nft_config = f"""# Sources: C24Be={stats.get('C24Be_AS_Network_List', 0)}, CyberOK={stats.get('CyberOK_Skipa_ips', 0)}, Collapsed={len(collapsed)}
+table inet scanners_block
+delete table inet scanners_block
+
+table inet scanners_block {{
     set scanners_v4 {{
         type ipv4_addr
         flags interval
@@ -917,6 +930,7 @@ table inet skipa_block {{
 
     chain prerouting {{
         type filter hook prerouting priority -150; policy accept;
+        ct state established,related accept
         ip saddr @scanners_v4 counter drop
     }}
 }}
@@ -926,33 +940,36 @@ with open(NFT_FILE, "w", encoding="utf-8") as f:
     f.write(nft_config)
 
 subprocess.run(["nft", "-f", NFT_FILE], check=True)
+print(f"OK: Loaded {len(collapsed)} collapsed IPv4 CIDRs (C24Be: {stats.get('C24Be_AS_Network_List', 0)}, CyberOK: {stats.get('CyberOK_Skipa_ips', 0)})")
 EOF
-    chmod +x /usr/local/sbin/update-skipa-blocklist.sh
-    /usr/local/sbin/update-skipa-blocklist.sh
+chmod +x /usr/local/sbin/update-scanners-blocklist.sh
 
-    cat <<'EOF' > /etc/systemd/system/skipa-blocklist.service
+cat <<'EOF' > /etc/systemd/system/scanners-blocklist.service
 [Unit]
-Description=Apply CyberOK Skipa nftables blocklist
+Description=Apply C24Be AS_Network_List & CyberOK Skipa nftables blocklist
 After=network-online.target nftables.service ufw.service
 Wants=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=/usr/sbin/nft -f /etc/nftables.d/skipa_block.nft
+ExecStart=/usr/sbin/nft -f /etc/nftables.d/scanners_block.nft
 RemainAfterExit=yes
 
 [Install]
 WantedBy=multi-user.target
 EOF
-    systemctl daemon-reload
-    systemctl enable skipa-blocklist.service >/dev/null
+systemctl daemon-reload
 
-    echo "15 4 * * * root /usr/local/sbin/update-skipa-blocklist.sh >/dev/null 2>&1" > /etc/cron.d/skipa-blocklist
-    chmod 644 /etc/cron.d/skipa-blocklist
-    log_ok "Блокировка CyberOK_Skipa_ips активирована."
+if [[ "$ENABLE_SCANNERS_BLOCK" =~ ^[Yy]$ ]]; then
+    log_info "Загрузка и применение списков C24Be + CyberOK Skipa в nftables..."
+    /usr/local/sbin/update-scanners-blocklist.sh
+    systemctl enable scanners-blocklist.service >/dev/null
+    echo "15 4 * * * root /usr/local/sbin/update-scanners-blocklist.sh >/dev/null 2>&1" > /etc/cron.d/scanners-blocklist
+    chmod 644 /etc/cron.d/scanners-blocklist
+    log_ok "Объединённая блокировка C24Be + CyberOK Skipa активирована."
 fi
 
-# 14. Установка CLI-утилиты my3xui (/usr/local/bin/my3xui) с прямым чтением БД и поддержкой extra
+# 14. Установка CLI-утилиты my3xui (/usr/local/bin/my3xui)
 log_info "Установка CLI-утилиты управления my3xui..."
 cat <<'EOF' > /usr/local/bin/my3xui
 #!/usr/bin/env bash
@@ -1096,16 +1113,80 @@ DBEOF
     echo ""
 }
 
+blocklist_status() {
+    if nft list table inet scanners_block &>/dev/null; then
+        PKTS=$(nft list chain inet scanners_block prerouting 2>/dev/null | grep -oE 'packets [0-9]+' | tail -n 1 || echo "packets 0")
+        META=$(head -n 1 /etc/nftables.d/scanners_block.nft 2>/dev/null | sed 's/^# //' || echo "active")
+        echo -e "  • ${BOLD}Статус nftables:${NC} ${GREEN}активен${NC} (${PKTS} отброшено)"
+        echo -e "  • ${BOLD}Списки (C24Be + CyberOK + Collapsed):${NC} ${META}"
+    else
+        echo -e "  • ${BOLD}Статус nftables:${NC} ${YELLOW}не установлен / отключен${NC}"
+    fi
+}
+
+blocklist_install() {
+    echo -e "${CYAN}[INFO] Загрузка и установка списков C24Be + CyberOK Skipa (сжатие Collapsed)...${NC}"
+    /usr/local/sbin/update-scanners-blocklist.sh
+    systemctl enable scanners-blocklist.service >/dev/null 2>&1 || true
+    echo "15 4 * * * root /usr/local/sbin/update-scanners-blocklist.sh >/dev/null 2>&1" > /etc/cron.d/scanners-blocklist
+    chmod 644 /etc/cron.d/scanners-blocklist
+    echo -e "${GREEN}[OK] Блокировка C24Be + CyberOK + Collapsed установлена, автообновление в cron (04:15) включено.${NC}"
+}
+
+blocklist_update() {
+    echo -e "${CYAN}[INFO] Обновление списков C24Be + CyberOK Skipa...${NC}"
+    /usr/local/sbin/update-scanners-blocklist.sh
+    echo -e "${GREEN}[OK] Списки успешно обновлены и применены в nftables.${NC}"
+}
+
+blocklist_remove() {
+    echo -e "${YELLOW}[INFO] Удаление блокировки C24Be + CyberOK из nftables...${NC}"
+    systemctl stop scanners-blocklist.service skipa-blocklist.service 2>/dev/null || true
+    systemctl disable scanners-blocklist.service skipa-blocklist.service 2>/dev/null || true
+    nft delete table inet scanners_block 2>/dev/null || true
+    nft delete table inet skipa_block 2>/dev/null || true
+    rm -f /etc/nftables.d/scanners_block.nft /etc/cron.d/scanners-blocklist \
+          /etc/nftables.d/skipa_block.nft /etc/cron.d/skipa-blocklist
+    echo -e "${GREEN}[OK] Блокировка сканеров полностью удалена из nftables и автозагрузки.${NC}"
+}
+
+manage_blocklist() {
+    case "${1:-}" in
+        install) blocklist_install ;;
+        update)  blocklist_update ;;
+        remove)  blocklist_remove ;;
+        status)  echo ""; blocklist_status; echo "" ;;
+        *)
+            while true; do
+                echo -e "\n${BOLD}${CYAN}=== БЛОКИРОВКА СКАНЕРОВ (C24Be + CyberOK + Collapsed) ===${NC}"
+                blocklist_status
+                echo ""
+                echo "  1. Установить / включить блокировку (nftables + cron)"
+                echo "  2. Обновить списки C24Be и CyberOK прямо сейчас"
+                echo "  3. Удалить / отключить блокировку"
+                echo "  0. Назад в главное меню"
+                echo ""
+                read -erp "Выберите действие [0-3]: " BL_CHOICE
+                case "$BL_CHOICE" in
+                    1) blocklist_install ;;
+                    2) blocklist_update ;;
+                    3) blocklist_remove ;;
+                    0) break ;;
+                    *) echo -e "${RED}Неверный выбор.${NC}" ;;
+                esac
+            done
+            ;;
+    esac
+}
+
 show_crowdsec() {
     echo -e "\n${BOLD}${CYAN}=== СОСТОЯНИЕ CROWDSEC И БЛОКИРОВОК ===${NC}"
     echo -e "${BOLD}1. Активные решения CrowdSec (cscli decisions list):${NC}"
     cscli decisions list || true
     echo -e "\n${BOLD}2. Статус баунсеров (cscli bouncers list):${NC}"
     cscli bouncers list || true
-    if nft list table inet skipa_block &>/dev/null; then
-        PKTS=$(nft list chain inet skipa_block prerouting 2>/dev/null | grep -oE 'packets [0-9]+' || echo "packets 0")
-        echo -e "\n${BOLD}3. CyberOK Skipa nftables:${NC} активен (${PKTS} отброшено)"
-    fi
+    echo -e "\n${BOLD}3. Блокировка сканеров (C24Be + CyberOK + Collapsed):${NC}"
+    blocklist_status
     echo ""
 }
 
@@ -1138,10 +1219,13 @@ clean_server() {
     rm -rf /etc/crowdsec /var/lib/crowdsec /etc/fail2ban /etc/apt/sources.list.d/crowdsec*
 
     echo -e "${YELLOW}[4/6] Очистка правил nftables и отключение UFW...${NC}"
-    systemctl stop skipa-blocklist.service 2>/dev/null || true
-    systemctl disable skipa-blocklist.service 2>/dev/null || true
+    systemctl stop scanners-blocklist.service skipa-blocklist.service 2>/dev/null || true
+    systemctl disable scanners-blocklist.service skipa-blocklist.service 2>/dev/null || true
+    nft delete table inet scanners_block 2>/dev/null || true
     nft delete table inet skipa_block 2>/dev/null || true
-    rm -f /etc/nftables.d/skipa_block.nft /usr/local/sbin/update-skipa-blocklist.sh \
+    rm -f /etc/nftables.d/scanners_block.nft /usr/local/sbin/update-scanners-blocklist.sh \
+          /etc/systemd/system/scanners-blocklist.service /etc/cron.d/scanners-blocklist \
+          /etc/nftables.d/skipa_block.nft /usr/local/sbin/update-skipa-blocklist.sh \
           /etc/systemd/system/skipa-blocklist.service /etc/cron.d/skipa-blocklist
     ufw --force disable >/dev/null 2>&1 || true
     ufw --force reset >/dev/null 2>&1 || true
@@ -1160,10 +1244,11 @@ clean_server() {
 }
 
 case "${1:-}" in
-    1|info)     show_sysinfo ;;
-    2|creds)    show_creds ;;
-    3|crowdsec) show_crowdsec ;;
-    4|clean)    clean_server ;;
+    1|info)      show_sysinfo ;;
+    2|creds)     show_creds ;;
+    3|crowdsec)  show_crowdsec ;;
+    4|blocklist) manage_blocklist "${2:-}" ;;
+    5|clean)     clean_server ;;
     *)
         while true; do
             echo -e "${BOLD}${CYAN}==================================================${NC}"
@@ -1171,16 +1256,18 @@ case "${1:-}" in
             echo -e "${BOLD}${CYAN}==================================================${NC}"
             echo "  1. Информация о системе (CPU, RAM, тип и размер дисков)"
             echo "  2. Данные для входа в панель 3x-ui и ссылки VLESS"
-            echo "  3. Состояние CrowdSec (cscli decisions list)"
-            echo -e "  4. ${RED}Очистка сервера (полное удаление всех компонентов)${NC}"
+            echo "  3. Состояние CrowdSec и активных блокировок"
+            echo "  4. Блокировка сканеров (установить / обновить / удалить C24Be + CyberOK)"
+            echo -e "  5. ${RED}Очистка сервера (полное удаление всех компонентов)${NC}"
             echo "  0. Выход"
             echo ""
-            read -erp "Выберите пункт [0-4]: " CHOICE
+            read -erp "Выберите пункт [0-5]: " CHOICE
             case "$CHOICE" in
                 1) show_sysinfo ;;
                 2) show_creds ;;
                 3) show_crowdsec ;;
-                4) clean_server ;;
+                4) manage_blocklist ;;
+                5) clean_server ;;
                 0) exit 0 ;;
                 *) echo -e "${RED}Неверный выбор.${NC}" ;;
             esac
@@ -1203,7 +1290,7 @@ echo -e "  • Протоколы:     XHTTP Packet-UP (#1) + XHTTP Stream-One (
 echo -e "  • UFW:           активен (открыты только SSH:${SSH_PORT}, 80, 443)"
 echo -e "  • Fail2Ban:      активен (sshd + nginx-botsearch через nftables)"
 echo -e "  • CrowdSec:      активен (crowdsec + nftables firewall bouncer)"
-echo -e "  • CyberOK Skipa: $([[ "$ENABLE_SKIPA" =~ ^[Yy]$ ]] && echo 'активен (nftables prerouting drop)' || echo 'отключен')"
-echo -e "  • CLI-утилита:   my3xui (info | creds | crowdsec | clean)"
+echo -e "  • Блок сканеров: $([[ "$ENABLE_SCANNERS_BLOCK" =~ ^[Yy]$ ]] && echo 'C24Be + CyberOK Skipa (nftables prerouting drop)' || echo 'отключен (my3xui blocklist install)')"
+echo -e "  • CLI-утилита:   my3xui (info | creds | crowdsec | blocklist | clean)"
 
 my3xui creds
