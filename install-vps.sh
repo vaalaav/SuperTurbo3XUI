@@ -3,7 +3,7 @@ set -eu
 
 # ============================================================================
 # Интерактивный установщик 3x-ui + Nginx HTTP/2 XHTTP + Security Stack
-# Инбаунды: VLESS-XHTTP-PacketUP + VLESS-XHTTP-StreamOne (с анти-ТСПУ обфускацией)
+# Инбаунды: XHTTP Packet-UP + Stream-One (авто-флаг и страна + анти-ТСПУ)
 # Поддержка: Ubuntu 24.04 / 26.04 LTS | Маска: iqubik/myfakesite / Reverse Proxy
 # Защита: UFW + Fail2Ban + CrowdSec + CyberOK_Skipa_ips + CLI-утилита my3xui
 # ============================================================================
@@ -56,12 +56,22 @@ echo -e "   ${BOLD}[URL]${NC}   — Введите URL сайта для Reverse
 read -erp "   Ваш выбор [myfakesite]: " REVERSE_PROXY_URL
 REVERSE_PROXY_URL=$(echo "$REVERSE_PROXY_URL" | tr -d '[:space:]')
 
-# Генерация случайных логина, пароля, портов (40000-56000) и секретных путей
-RAND_USER="u$(openssl rand -hex 5)"
+# Генерация сложных случайных логина (12 симв.) и пароля (20 симв. со спецсимволами)
+RAND_USER=$(python3 -c 'import secrets, string; alphabet = string.ascii_letters + string.digits; print("".join(secrets.choice(alphabet) for _ in range(12)))')
 read -erp "4. Логин администратора 3x-ui [${RAND_USER}]: " PANEL_USER
 PANEL_USER=${PANEL_USER:-"$RAND_USER"}
 
-RAND_PASS=$(openssl rand -hex 8)
+RAND_PASS=$(python3 -c '
+import secrets, string
+upper, lower, digits, syms = string.ascii_uppercase, string.ascii_lowercase, string.digits, "!@#%^&*_-+="
+alphabet = upper + lower + digits + syms
+while True:
+    pwd = "".join(secrets.choice(alphabet) for _ in range(20))
+    if (any(c in upper for c in pwd) and any(c in lower for c in pwd)
+        and any(c in digits for c in pwd) and any(c in syms for c in pwd)):
+        print(pwd)
+        break
+')
 read -erp "5. Пароль администратора 3x-ui [${RAND_PASS}]: " PANEL_PASS
 PANEL_PASS=${PANEL_PASS:-"$RAND_PASS"}
 
@@ -84,7 +94,7 @@ SSH_PORT=${SSH_PORT:-22}
 
 echo -e "\n${YELLOW}Сводка параметров перед установкой:${NC}"
 echo "  • Домен:          ${DOMAIN}"
-echo "  • Протоколы:      VLESS-XHTTP-PacketUP + VLESS-XHTTP-StreamOne (анти-ТСПУ профиль)"
+echo "  • Протоколы:      XHTTP Packet-UP (#1) + XHTTP Stream-One (#2) [авто-флаг + страна]"
 echo "  • Маскировка:     ${REVERSE_PROXY_URL:-Локальный сайт iqubik/myfakesite}"
 echo "  • Порт панели:    127.0.0.1:${PANEL_PORT} (путь /${PANEL_PATH}/)"
 echo "  • Порт подписки:  127.0.0.1:${SUB_PORT} (путь /${SUB_PATH}/)"
@@ -274,7 +284,7 @@ n
 EOF
 systemctl stop x-ui
 
-log_info "Генерация UUID и патчинг базы данных 3x-ui (XHTTP Packet-UP + Stream-One с обфускацией)..."
+log_info "Определение геолокации IP сервера, генерация UUID и патчинг базы 3x-ui..."
 XRAY_BIN=$(find /usr/local/x-ui/bin -name "xray-linux-*" | head -n 1)
 [[ -z "$XRAY_BIN" ]] && log_err "Бинарный файл Xray не найден в /usr/local/x-ui/bin!"
 
@@ -282,7 +292,69 @@ UUID_XHTTP_UP=$("$XRAY_BIN" uuid)
 UUID_XHTTP_ONE=$("$XRAY_BIN" uuid)
 
 python3 - <<PYEOF
-import sqlite3, json
+import sqlite3, json, urllib.request
+
+def detect_server_country():
+    country_names_ru = {
+        "NL": "Нидерланды", "DE": "Германия", "FR": "Франция", "FI": "Финляндия",
+        "SE": "Швеция", "NO": "Норвегия", "DK": "Дания", "GB": "Великобритания",
+        "UK": "Великобритания", "IE": "Ирландия", "PL": "Польша", "CZ": "Чехия",
+        "AT": "Австрия", "CH": "Швейцария", "BE": "Бельгия", "LU": "Люксембург",
+        "ES": "Испания", "IT": "Италия", "PT": "Португалия", "GR": "Греция",
+        "BG": "Болгария", "RO": "Румыния", "HU": "Венгрия", "SK": "Словакия",
+        "SI": "Словения", "HR": "Хорватия", "RS": "Сербия", "EE": "Эстония",
+        "LV": "Латвия", "LT": "Литва", "MD": "Молдова", "UA": "Украина",
+        "BY": "Беларусь", "RU": "Россия", "KZ": "Казахстан", "AM": "Армения",
+        "GE": "Грузия", "AZ": "Азербайджан", "UZ": "Узбекистан", "TR": "Турция",
+        "AE": "ОАЭ", "IL": "Израиль", "CY": "Кипр", "US": "США", "CA": "Канада",
+        "BR": "Бразилия", "AR": "Аргентина", "CL": "Чили", "JP": "Япония",
+        "KR": "Южная Корея", "SG": "Сингапур", "HK": "Гонконг", "TW": "Тайвань",
+        "IN": "Индия", "AU": "Австралия", "NZ": "Новая Зеландия", "ZA": "ЮАР"
+    }
+
+    ip = ""
+    for ip_url in ("https://api.ipify.org", "https://ifconfig.me/ip", "https://icanhazip.com"):
+        try:
+            req = urllib.request.Request(ip_url, headers={"User-Agent": "curl/8.0"})
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                ip = resp.read().decode("utf-8").strip()
+                if ip:
+                    break
+        except Exception:
+            pass
+
+    code = ""
+    fallback_name = ""
+    if ip:
+        try:
+            req = urllib.request.Request(f"http://ip-api.com/json/{ip}?fields=status,country,countryCode", headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=6) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                if data.get("status") == "success":
+                    code = (data.get("countryCode") or "").upper()
+                    fallback_name = data.get("country") or ""
+        except Exception:
+            pass
+
+    if not code:
+        try:
+            url = f"https://ipinfo.io/{ip}/json" if ip else "https://ipinfo.io/json"
+            req = urllib.request.Request(url, headers={"User-Agent": "curl/8.0"})
+            with urllib.request.urlopen(req, timeout=6) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                code = (data.get("country") or "").upper()
+        except Exception:
+            pass
+
+    if len(code) == 2 and code.isalpha():
+        flag = "".join(chr(0x1F1E6 + ord(c) - ord("A")) for c in code)
+        name = country_names_ru.get(code) or fallback_name or code
+        return f"{flag} {name}"
+
+    return "🌐 Сервер"
+
+base_remark = detect_server_country()
+print(f"Определено базовое имя локации: {base_remark}")
 
 db_path = "/etc/x-ui/x-ui.db"
 conn = sqlite3.connect(db_path)
@@ -325,7 +397,7 @@ inbounds = [
         "up": 0,
         "down": 0,
         "total": 0,
-        "remark": "VLESS-XHTTP-PacketUP",
+        "remark": f"{base_remark} 1",
         "enable": 1,
         "expiry_time": 0,
         "listen": "127.0.0.1",
@@ -372,7 +444,7 @@ inbounds = [
         "up": 0,
         "down": 0,
         "total": 0,
-        "remark": "VLESS-XHTTP-StreamOne",
+        "remark": f"{base_remark} 2",
         "enable": 1,
         "expiry_time": 0,
         "listen": "127.0.0.1",
@@ -1120,18 +1192,14 @@ chmod +x /usr/local/bin/my3xui
 
 # 15. Сохранение резервной копии учетных данных и финальный вывод
 INFO_FILE="/root/vps-credentials.txt"
-cat <<EOF > "$INFO_FILE"
-Ссылка на панель 3x-ui:  https://${DOMAIN}/${PANEL_PATH}/
-Логин:                   ${PANEL_USER}
-Пароль:                  ${PANEL_PASS}
-Единая подписка:         https://${DOMAIN}/${SUB_PATH}/main_sub
-EOF
+printf "Ссылка на панель 3x-ui:  https://%s/%s/\nЛогин:                   %s\nПароль:                  %s\nЕдиная подписка:         https://%s/%s/main_sub\n" \
+    "${DOMAIN}" "${PANEL_PATH}" "${PANEL_USER}" "${PANEL_PASS}" "${DOMAIN}" "${SUB_PATH}" > "$INFO_FILE"
 chmod 600 "$INFO_FILE"
 
 echo -e "\n${GREEN}${BOLD}=================================================================${NC}"
 echo -e "${GREEN}${BOLD}  УСТАНОВКА УСПЕШНО ЗАВЕРШЕНА!                                   ${NC}"
 echo -e "${GREEN}${BOLD}=================================================================${NC}"
-echo -e "  • Протоколы:     VLESS-XHTTP-PacketUP + VLESS-XHTTP-StreamOne (анти-ТСПУ)"
+echo -e "  • Протоколы:     XHTTP Packet-UP (#1) + XHTTP Stream-One (#2) [анти-ТСПУ]"
 echo -e "  • UFW:           активен (открыты только SSH:${SSH_PORT}, 80, 443)"
 echo -e "  • Fail2Ban:      активен (sshd + nginx-botsearch через nftables)"
 echo -e "  • CrowdSec:      активен (crowdsec + nftables firewall bouncer)"
