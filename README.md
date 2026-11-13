@@ -23,7 +23,7 @@
 curl -fsSL https://raw.githubusercontent.com/vaalaav/SuperTurbo3XUI/main/install-vps.sh -o /root/install-vps.sh && bash /root/install-vps.sh
 ~~~
 
-> [!CAUTION]
+> [!ВНИМАНИЕ]
 > **Требования: чистый VPS с 1+ CPU, 1+ GB RAM и заранее привязанным к IP-адресу сервера доменом (A-запись).**
 
 ---
