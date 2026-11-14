@@ -4,7 +4,7 @@ set -eu
 # ============================================================================
 # Интерактивный установщик 3x-ui + Nginx HTTP/2 XHTTP + Security Stack
 # Инбаунды: XHTTP Packet-UP ("Мобилы") + Stream-One ("Домашний") + анти-ТСПУ
-# Маршрутизация: блокировка BitTorrent, Private IPs, Ads, Malware/Phishing
+# Маршрутизация: api->api, блокировка BitTorrent, Private IPs, Ads, Malware
 # Поддержка: Ubuntu 24.04 / 26.04 LTS | Маска: iqubik/myfakesite / Reverse Proxy
 # Защита: UFW + Fail2Ban + CrowdSec + C24Be AS_Network_List + CyberOK_Skipa_ips
 # ============================================================================
@@ -96,7 +96,7 @@ SSH_PORT=${SSH_PORT:-22}
 echo -e "\n${YELLOW}Сводка параметров перед установкой:${NC}"
 echo "  • Домен:          ${DOMAIN}"
 echo "  • Протоколы:      XHTTP Packet-UP («Мобилы») + XHTTP Stream-One («Домашний»)"
-echo "  • Роутинг Xray:   Блокировка BitTorrent, Private IPs, Ads, Malware/Phishing"
+echo "  • Роутинг Xray:   api->api + блокировка BitTorrent, Private IPs, Ads, Malware/Phishing"
 echo "  • Маскировка:     ${REVERSE_PROXY_URL:-Локальный сайт iqubik/myfakesite}"
 echo "  • Порт панели:    127.0.0.1:${PANEL_PORT} (путь /${PANEL_PATH}/)"
 echo "  • Порт подписки:  127.0.0.1:${SUB_PORT} (путь /${SUB_PATH}/)"
@@ -188,8 +188,12 @@ log_info "Получение SSL-сертификата для ${DOMAIN}..."
 systemctl stop nginx || true
 mkdir -p "/root/cert/${DOMAIN}" /var/www/html
 
-certbot certonly --standalone --non-interactive --agree-tos \
-    --email "${LE_EMAIL}" -d "${DOMAIN}" --key-type ecdsa
+if [[ ! -f "/etc/letsencrypt/live/${DOMAIN}/fullchain.pem" ]]; then
+    certbot certonly --standalone --non-interactive --agree-tos \
+        --email "${LE_EMAIL}" -d "${DOMAIN}" --key-type ecdsa
+else
+    log_info "Сертификат для ${DOMAIN} уже существует, используем его."
+fi
 
 ln -sf "/etc/letsencrypt/live/${DOMAIN}/fullchain.pem" "/root/cert/${DOMAIN}/fullchain.pem"
 ln -sf "/etc/letsencrypt/live/${DOMAIN}/privkey.pem" "/root/cert/${DOMAIN}/privkey.pem"
@@ -204,7 +208,8 @@ chmod +x /etc/letsencrypt/renewal-hooks/deploy/reload-services.sh
 
 # 7. Подготовка сайта-заглушки (адаптированный iqubik/myfakesite или Reverse Proxy)
 log_info "Настройка маскировочного сайта..."
-mkdir -p /var/cache/nginx/img_cache /var/cache/nginx/html_cache /var/www/myfakesite /var/www/html
+mkdir -p /var/cache/nginx/img_cache /var/cache/nginx/html_cache /var/www/myfakesite /var/www/html /var/log/nginx
+touch /var/log/nginx/access.log /var/log/nginx/error.log
 
 if [[ -z "$REVERSE_PROXY_URL" ]]; then
     log_info "Загрузка фронтенда iqubik/myfakesite (без Docker/PHP)..."
@@ -277,14 +282,18 @@ cat <<'EOF' > /var/www/html/404.html
 <h1>404 Not Found</h1><hr><p>nginx</p></body></html>
 EOF
 
-chown -R www-data:www-data /var/cache/nginx /var/www
+chown -R www-data:www-data /var/cache/nginx /var/www /var/log/nginx
 
-# 8. Установка 3x-ui и автоматический патчинг базы /etc/x-ui/x-ui.db
+# 8. Установка 3x-ui, загрузка расширенных баз geosite и патчинг /etc/x-ui/x-ui.db
 log_info "Установка панели 3x-ui..."
 bash <(curl -Ls https://raw.githubusercontent.com/MHSanaei/3x-ui/master/install.sh) <<EOF
 n
 EOF
 systemctl stop x-ui
+
+log_info "Загрузка баз geosite_IR.dat и geosite_RU.dat для фильтрации рекламы, фишинга и майнеров..."
+curl -fsSL "https://github.com/chocolate4u/Iran-v2ray-rules/releases/latest/download/geosite.dat" -o /usr/local/x-ui/bin/geosite_IR.dat || true
+curl -fsSL "https://github.com/runetfreedom/russia-v2ray-rules-dat/releases/latest/download/geosite.dat" -o /usr/local/x-ui/bin/geosite_RU.dat || true
 
 log_info "Определение геолокации IP сервера, генерация UUID, настройка роутинга и патчинг базы 3x-ui..."
 XRAY_BIN=$(find /usr/local/x-ui/bin -name "xray-linux-*" | head -n 1)
@@ -293,8 +302,27 @@ XRAY_BIN=$(find /usr/local/x-ui/bin -name "xray-linux-*" | head -n 1)
 UUID_XHTTP_UP=$("$XRAY_BIN" uuid)
 UUID_XHTTP_ONE=$("$XRAY_BIN" uuid)
 
-python3 - <<PYEOF
+DOMAIN="$DOMAIN" \
+PANEL_PORT="$PANEL_PORT" \
+PANEL_PATH="$PANEL_PATH" \
+SUB_PORT="$SUB_PORT" \
+SUB_PATH="$SUB_PATH" \
+UUID_XHTTP_UP="$UUID_XHTTP_UP" \
+UUID_XHTTP_ONE="$UUID_XHTTP_ONE" \
+XHTTP_UP_PATH="$XHTTP_UP_PATH" \
+XHTTP_ONE_PATH="$XHTTP_ONE_PATH" \
+python3 - <<'PYEOF'
 import sqlite3, json, urllib.request, os
+
+domain = os.environ["DOMAIN"]
+panel_port = os.environ["PANEL_PORT"]
+panel_path = os.environ["PANEL_PATH"]
+sub_port = os.environ["SUB_PORT"]
+sub_path = os.environ["SUB_PATH"]
+uuid_up = os.environ["UUID_XHTTP_UP"]
+uuid_one = os.environ["UUID_XHTTP_ONE"]
+xhttp_up_path = os.environ["XHTTP_UP_PATH"]
+xhttp_one_path = os.environ["XHTTP_ONE_PATH"]
 
 def detect_server_country():
     country_names_ru = {
@@ -364,18 +392,18 @@ conn = sqlite3.connect(db_path)
 cur = conn.cursor()
 
 settings_map = {
-    "webPort": "${PANEL_PORT}",
+    "webPort": panel_port,
     "webListen": "127.0.0.1",
-    "webBasePath": "/${PANEL_PATH}/",
-    "webCertFile": "/root/cert/${DOMAIN}/fullchain.pem",
-    "webKeyFile": "/root/cert/${DOMAIN}/privkey.pem",
+    "webBasePath": f"/{panel_path}/",
+    "webCertFile": f"/root/cert/{domain}/fullchain.pem",
+    "webKeyFile": f"/root/cert/{domain}/privkey.pem",
     "subEnable": "true",
     "subListen": "127.0.0.1",
-    "subPort": "${SUB_PORT}",
-    "subPath": "/${SUB_PATH}/",
-    "subCertFile": "/root/cert/${DOMAIN}/fullchain.pem",
-    "subKeyFile": "/root/cert/${DOMAIN}/privkey.pem",
-    "subURI": "https://${DOMAIN}/${SUB_PATH}/",
+    "subPort": sub_port,
+    "subPath": f"/{sub_path}/",
+    "subCertFile": f"/root/cert/{domain}/fullchain.pem",
+    "subKeyFile": f"/root/cert/{domain}/privkey.pem",
+    "subURI": f"https://{domain}/{sub_path}/",
     "twoFactorEnable": "false"
 }
 
@@ -386,15 +414,7 @@ for k, v in settings_map.items():
     else:
         cur.execute("INSERT INTO settings (key, value) VALUES (?, ?)", (k, v))
 
-# Настройка маршрутизации Xray: блокировка BitTorrent, Private IPs, Ads, Malware/Phishing/Cryptominers
-row = cur.execute("SELECT value FROM settings WHERE key = 'xrayTemplateConfig'").fetchone()
-tpl = json.loads(row[0]) if row and row[0] else {}
-
-tpl["outbounds"] = [
-    {"tag": "direct", "protocol": "freedom", "settings": {}},
-    {"tag": "blocked", "protocol": "blackhole", "settings": {}}
-]
-
+# Полный системный каркас xrayTemplateConfig (сохраняет работу gRPC API статистики 3x-ui)
 domain_blocks = ["geosite:category-ads-all"]
 if os.path.exists(os.path.join(bin_dir, "geosite_RU.dat")):
     domain_blocks.append("ext:geosite_RU.dat:category-ads-all")
@@ -406,33 +426,68 @@ if os.path.exists(os.path.join(bin_dir, "geosite_IR.dat")):
         "ext:geosite_IR.dat:category-ads-all"
     ])
 
-tpl["routing"] = {
-    "domainStrategy": "AsIs",
-    "rules": [
+tpl = {
+    "log": {
+        "loglevel": "warning"
+    },
+    "api": {
+        "tag": "api",
+        "services": ["HandlerService", "LoggerService", "StatsService"]
+    },
+    "inbounds": [
         {
-            "type": "field",
-            "inboundTag": ["api"],
-            "outboundTag": "api"
-        },
-        {
-            "type": "field",
-            "outboundTag": "blocked",
-            "protocol": ["bittorrent"]
-        },
-        {
-            "type": "field",
-            "outboundTag": "blocked",
-            "ip": ["geoip:private"]
-        },
-        {
-            "type": "field",
-            "outboundTag": "blocked",
-            "domain": domain_blocks
+            "tag": "api",
+            "listen": "127.0.0.1",
+            "port": 62789,
+            "protocol": "dokodemo-door",
+            "settings": {"address": "127.0.0.1"}
         }
-    ]
+    ],
+    "outbounds": [
+        {"tag": "direct", "protocol": "freedom", "settings": {}},
+        {"tag": "blocked", "protocol": "blackhole", "settings": {}}
+    ],
+    "policy": {
+        "levels": {
+            "0": {"statsUserDownlink": True, "statsUserUplink": True}
+        },
+        "system": {
+            "statsInboundDownlink": True,
+            "statsInboundUplink": True,
+            "statsOutboundDownlink": True,
+            "statsOutboundUplink": True
+        }
+    },
+    "routing": {
+        "domainStrategy": "AsIs",
+        "rules": [
+            {
+                "type": "field",
+                "inboundTag": ["api"],
+                "outboundTag": "api"
+            },
+            {
+                "type": "field",
+                "outboundTag": "blocked",
+                "protocol": ["bittorrent"]
+            },
+            {
+                "type": "field",
+                "outboundTag": "blocked",
+                "ip": ["geoip:private"]
+            },
+            {
+                "type": "field",
+                "outboundTag": "blocked",
+                "domain": domain_blocks
+            }
+        ]
+    },
+    "stats": {}
 }
 
 tpl_val = json.dumps(tpl, indent=2)
+row = cur.execute("SELECT id FROM settings WHERE key = 'xrayTemplateConfig'").fetchone()
 if row:
     cur.execute("UPDATE settings SET value = ? WHERE key = 'xrayTemplateConfig'", (tpl_val,))
 else:
@@ -460,9 +515,9 @@ inbounds = [
         "protocol": "vless",
         "settings": json.dumps({
             "clients": [{
-                "id": "${UUID_XHTTP_UP}",
+                "id": uuid_up,
                 "flow": "",
-                "email": "xhttp_up_${DOMAIN}",
+                "email": f"xhttp_up_{domain}",
                 "enable": True,
                 "subId": "main_sub"
             }],
@@ -473,13 +528,13 @@ inbounds = [
             "security": "none",
             "externalProxy": [{
                 "forceTls": "tls",
-                "dest": "${DOMAIN}",
+                "dest": domain,
                 "port": 443,
                 "remark": ""
             }],
             "xhttpSettings": {
-                "path": "/${XHTTP_UP_PATH}/",
-                "host": "${DOMAIN}",
+                "path": f"/{xhttp_up_path}/",
+                "host": domain,
                 "mode": "packet-up",
                 "noGRPCHeader": True,
                 "xPaddingBytes": "100-1000",
@@ -507,9 +562,9 @@ inbounds = [
         "protocol": "vless",
         "settings": json.dumps({
             "clients": [{
-                "id": "${UUID_XHTTP_ONE}",
+                "id": uuid_one,
                 "flow": "",
-                "email": "xhttp_one_${DOMAIN}",
+                "email": f"xhttp_one_{domain}",
                 "enable": True,
                 "subId": "main_sub"
             }],
@@ -520,13 +575,13 @@ inbounds = [
             "security": "none",
             "externalProxy": [{
                 "forceTls": "tls",
-                "dest": "${DOMAIN}",
+                "dest": domain,
                 "port": 443,
                 "remark": ""
             }],
             "xhttpSettings": {
-                "path": "/${XHTTP_ONE_PATH}/",
-                "host": "${DOMAIN}",
+                "path": f"/{xhttp_one_path}/",
+                "host": domain,
                 "mode": "stream-one",
                 "noGRPCHeader": True,
                 "xPaddingBytes": "100-1000",
@@ -873,7 +928,7 @@ sleep 2
 systemctl enable --now nginx
 systemctl restart x-ui nginx
 
-# 11. Настройка Fail2Ban (systemd backend для Ubuntu 24.04/26.04)
+# 11. Настройка Fail2Ban (systemd для sshd + polling для файла лога nginx)
 log_info "Настройка Fail2Ban..."
 cat <<EOF > /etc/fail2ban/jail.local
 [DEFAULT]
@@ -890,7 +945,7 @@ port = ${SSH_PORT}
 [nginx-botsearch]
 enabled = true
 port = http,https
-backend = auto
+backend = polling
 logpath = /var/log/nginx/access.log
 maxretry = 10
 findtime = 5m
@@ -907,7 +962,7 @@ apt-get install -y -qq crowdsec crowdsec-firewall-bouncer-nftables
 cscli collections install crowdsecurity/linux crowdsecurity/sshd crowdsecurity/nginx --force >/dev/null 2>&1 || true
 rm -f /etc/crowdsec/acquis.d/nginx.yaml
 
-cscli bouncers delete firewall-bouncer 2>/dev/null || true
+cscli bouncers delete firewall-bouncer >/dev/null 2>&1 || true
 BOUNCER_KEY=$(cscli bouncers add firewall-bouncer -o raw)
 sed -i "s|^api_key:.*|api_key: ${BOUNCER_KEY}|" /etc/crowdsec/bouncers/crowdsec-firewall-bouncer.yaml
 sed -i "s|^mode:.*|mode: nftables|" /etc/crowdsec/bouncers/crowdsec-firewall-bouncer.yaml
@@ -1342,7 +1397,7 @@ echo -e "\n${GREEN}${BOLD}======================================================
 echo -e "${GREEN}${BOLD}  УСТАНОВКА УСПЕШНО ЗАВЕРШЕНА!                                   ${NC}"
 echo -e "${GREEN}${BOLD}=================================================================${NC}"
 echo -e "  • Протоколы:     XHTTP Packet-UP («Мобилы») + XHTTP Stream-One («Домашний»)"
-echo -e "  • Роутинг Xray:  блокировка BitTorrent, Private IPs, Ads, Malware/Phishing"
+echo -e "  • Роутинг Xray:  api->api + блокировка BitTorrent, Private IPs, Ads, Malware/Phishing"
 echo -e "  • UFW:           активен (открыты только SSH:${SSH_PORT}, 80, 443)"
 echo -e "  • Fail2Ban:      активен (sshd + nginx-botsearch через nftables)"
 echo -e "  • CrowdSec:      активен (crowdsec + nftables firewall bouncer)"
