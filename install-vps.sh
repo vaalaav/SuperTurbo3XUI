@@ -2,7 +2,7 @@
 set -eu
 
 # ============================================================================
-# Интерактивный установщик 3x-ui + Nginx HTTP/2 XHTTP + Security Stack
+# Интерактивный установщик 3x-ui 3.11+ + Nginx HTTP/2 XHTTP + Security Stack
 # Инбаунды: XHTTP Packet-UP ("Мобилы") + Stream-One ("Домашний") + анти-ТСПУ
 # Маршрутизация: api->api, блокировка BitTorrent, Private IPs, Ads, Malware
 # Поддержка: Ubuntu 24.04 / 26.04 LTS | Маска: iqubik/myfakesite / Reverse Proxy
@@ -40,13 +40,27 @@ echo -e "${BOLD}${CYAN}=========================================================
 echo -e "${BOLD}   Установка 3x-ui (XHTTP Packet-UP + Stream-One) + Security      ${NC}"
 echo -e "${BOLD}${CYAN}=================================================================${NC}\n"
 
-# 2. Интерактивный ввод параметров
+# 2. Интерактивный ввод параметров и предварительная проверка DNS
 while true; do
     read -erp "1. Введите ваш основной домен (например, node.example.com): " DOMAIN
     DOMAIN=$(echo "$DOMAIN" | LC_ALL=C tr -cd "a-zA-Z0-9.-" | tr "A-Z" "a-z")
     [[ -n "$DOMAIN" && "$DOMAIN" == *.* ]] && break
     echo -e "${RED}Некорректный домен. Попробуйте снова.${NC}"
 done
+
+SERVER_IP=$(curl -4 -fsSL --max-time 5 https://api.ipify.org 2>/dev/null || curl -4 -fsSL --max-time 5 https://ifconfig.me/ip 2>/dev/null || true)
+DOMAIN_IPS=$(getent ahostsv4 "$DOMAIN" 2>/dev/null | awk '{print $1}' | sort -u || true)
+if [[ -z "$DOMAIN_IPS" ]]; then
+    log_warn "Домен ${DOMAIN} сейчас не резолвится в IPv4 (A-запись не найдена)!"
+    read -erp "Certbot не сможет выпустить сертификат без DNS. Всё равно продолжить? [y/N]: " dns_cont
+    [[ ! "$dns_cont" =~ ^[Yy]$ ]] && exit 1
+elif [[ -n "$SERVER_IP" ]] && ! grep -qx "$SERVER_IP" <<< "$DOMAIN_IPS"; then
+    log_warn "Домен ${DOMAIN} указывает на (${DOMAIN_IPS//$'\n'/, }), а IP этого сервера: ${SERVER_IP}!"
+    read -erp "Выпуск SSL-сертификата Let's Encrypt упадёт, если включен прокси/CDN или неверный IP. Продолжить? [y/N]: " dns_cont
+    [[ ! "$dns_cont" =~ ^[Yy]$ ]] && exit 1
+else
+    log_ok "DNS-проверка пройдена: ${DOMAIN} -> ${SERVER_IP:-OK}"
+fi
 
 read -erp "2. Введите Email для Let's Encrypt [admin@${DOMAIN}]: " LE_EMAIL
 LE_EMAIL=${LE_EMAIL:-"admin@${DOMAIN}"}
@@ -87,11 +101,19 @@ SUB_PATH=$(openssl rand -hex 12)
 XHTTP_UP_PATH="media/ts/$(openssl rand -hex 4)"
 XHTTP_ONE_PATH="media/ts/1080/$(openssl rand -hex 4)"
 
-SSH_PORT=$(ss -tlnp 2>/dev/null | awk '/sshd|ssh\.socket/ {split($4,a,":"); print a[length(a)]; exit}')
+# Надёжное определение порта SSH (sshd -T + ssh.socket + активная сессия $SSH_CONNECTION)
+SSH_PORT=""
+if command -v sshd >/dev/null 2>&1; then
+    SSH_PORT=$(sshd -T 2>/dev/null | awk '/^port / {print $2; exit}' || true)
+fi
 if [[ -z "$SSH_PORT" ]]; then
-    SSH_PORT=$(grep -E "^Port " /etc/ssh/sshd_config 2>/dev/null | awk '{print $2; exit}')
+    SSH_PORT=$(systemctl show ssh.socket -p Listen 2>/dev/null | grep -oE '[0-9]+$' | head -n 1 || true)
+fi
+if [[ -z "$SSH_PORT" ]]; then
+    SSH_PORT=$(ss -tlnp 2>/dev/null | awk '/sshd|ssh\.socket/ {split($4,a,":"); print a[length(a)]; exit}' || true)
 fi
 SSH_PORT=${SSH_PORT:-22}
+ACTIVE_SSH_PORT=$(awk '{print $4}' <<< "${SSH_CONNECTION:-}" 2>/dev/null || true)
 
 echo -e "\n${YELLOW}Сводка параметров перед установкой:${NC}"
 echo "  • Домен:          ${DOMAIN}"
@@ -169,7 +191,7 @@ fs.inotify.max_user_instances = 8192
 fs.inotify.max_user_watches = 524288
 net.ipv4.tcp_notsent_lowat = 16384
 EOF
-sysctl --system >/dev/null
+sysctl --system >/dev/null 2>&1 || log_warn "Часть параметров sysctl пропущена (ограничения виртуализации)."
 
 # 5. Настройка UFW
 log_info "Настройка файрвола UFW (SSH: ${SSH_PORT}, HTTP: 80, HTTPS: 443)..."
@@ -177,13 +199,16 @@ ufw --force reset >/dev/null
 ufw default deny incoming >/dev/null
 ufw default allow outgoing >/dev/null
 ufw allow "${SSH_PORT}/tcp" comment 'SSH' >/dev/null
+if [[ -n "$ACTIVE_SSH_PORT" && "$ACTIVE_SSH_PORT" != "$SSH_PORT" ]]; then
+    ufw allow "${ACTIVE_SSH_PORT}/tcp" comment 'SSH Active Session' >/dev/null
+fi
 ufw allow 80/tcp comment 'HTTP ACME' >/dev/null
 ufw allow 443/tcp comment 'HTTPS Proxy' >/dev/null
 ufw allow 443/udp comment 'QUIC / HTTP3' >/dev/null
 ufw --force enable >/dev/null
 log_ok "UFW активирован."
 
-# 6. Выпуск SSL-сертификата Let's Encrypt
+# 6. Выпуск SSL-сертификата Let's Encrypt и настройка webroot для автопродления без остановки Nginx
 log_info "Получение SSL-сертификата для ${DOMAIN}..."
 systemctl stop nginx || true
 mkdir -p "/root/cert/${DOMAIN}" /var/www/html
@@ -197,6 +222,18 @@ fi
 
 ln -sf "/etc/letsencrypt/live/${DOMAIN}/fullchain.pem" "/root/cert/${DOMAIN}/fullchain.pem"
 ln -sf "/etc/letsencrypt/live/${DOMAIN}/privkey.pem" "/root/cert/${DOMAIN}/privkey.pem"
+
+# Перевод конфигурации продления certbot с standalone на webroot (/var/www/html), чтобы Nginx на 80 порту не мешал renew
+RENEW_CONF="/etc/letsencrypt/renewal/${DOMAIN}.conf"
+if [[ -f "$RENEW_CONF" ]]; then
+    sed -i 's|^authenticator = standalone|authenticator = webroot|' "$RENEW_CONF"
+    if ! grep -q '^webroot_path' "$RENEW_CONF"; then
+        sed -i '/^authenticator = webroot/a webroot_path = /var/www/html,' "$RENEW_CONF"
+    fi
+    if ! grep -q '^\[webroot_map\]' "$RENEW_CONF"; then
+        printf "\n[[webroot_map]]\n%s = /var/www/html\n" "${DOMAIN}" >> "$RENEW_CONF"
+    fi
+fi
 
 mkdir -p /etc/letsencrypt/renewal-hooks/deploy
 cat <<'EOF' > /etc/letsencrypt/renewal-hooks/deploy/reload-services.sh
@@ -292,8 +329,8 @@ EOF
 systemctl stop x-ui
 
 log_info "Загрузка баз geosite_IR.dat и geosite_RU.dat для фильтрации рекламы, фишинга и майнеров..."
-curl -fsSL "https://github.com/chocolate4u/Iran-v2ray-rules/releases/latest/download/geosite.dat" -o /usr/local/x-ui/bin/geosite_IR.dat || true
-curl -fsSL "https://github.com/runetfreedom/russia-v2ray-rules-dat/releases/latest/download/geosite.dat" -o /usr/local/x-ui/bin/geosite_RU.dat || true
+curl -fsSL "https://github.com/chocolate4u/Iran-v2ray-rules/releases/latest/download/geosite.dat" -o /usr/local/x-ui/bin/geosite_IR.dat || log_warn "Не удалось скачать geosite_IR.dat"
+curl -fsSL "https://github.com/runetfreedom/russia-v2ray-rules-dat/releases/latest/download/geosite.dat" -o /usr/local/x-ui/bin/geosite_RU.dat || log_warn "Не удалось скачать geosite_RU.dat"
 
 log_info "Определение геолокации IP сервера, генерация UUID, настройка роутинга и патчинг базы 3x-ui..."
 XRAY_BIN=$(find /usr/local/x-ui/bin -name "xray-linux-*" | head -n 1)
@@ -312,7 +349,7 @@ UUID_XHTTP_ONE="$UUID_XHTTP_ONE" \
 XHTTP_UP_PATH="$XHTTP_UP_PATH" \
 XHTTP_ONE_PATH="$XHTTP_ONE_PATH" \
 python3 - <<'PYEOF'
-import sqlite3, json, urllib.request, os
+import sqlite3, json, urllib.request, os, time
 
 domain = os.environ["DOMAIN"]
 panel_port = os.environ["PANEL_PORT"]
@@ -493,16 +530,25 @@ if row:
 else:
     cur.execute("INSERT INTO settings (key, value) VALUES ('xrayTemplateConfig', ?)", (tpl_val,))
 
-cur.execute("DELETE FROM inbounds")
+# Очистка старых таблиц клиентов и инбаундов + сброс флага сидера ClientsTable,
+# чтобы при запуске 3x-ui 3.11+ сама мигрировала клиентов из inbounds.settings в таблицы clients и client_inbounds
+for tbl in ("inbounds", "client_traffics", "client_inbounds", "clients", "seeders"):
+    try:
+        cur.execute(f"DELETE FROM {tbl}")
+    except sqlite3.OperationalError:
+        pass
 
 browser_headers = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
     "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7"
 }
 
+now_ms = int(time.time() * 1000)
+
 inbounds = [
     # Inbound 1: VLESS XHTTP Packet-UP (127.0.0.1:11443) -> Мобилы
     {
+        "id": 1,
         "user_id": 1,
         "up": 0,
         "down": 0,
@@ -513,15 +559,26 @@ inbounds = [
         "listen": "127.0.0.1",
         "port": 11443,
         "protocol": "vless",
+        "client_id": uuid_up,
+        "client_email": f"xhttp_up_{domain}",
         "settings": json.dumps({
             "clients": [{
                 "id": uuid_up,
                 "flow": "",
                 "email": f"xhttp_up_{domain}",
+                "limitIp": 0,
+                "totalGB": 0,
+                "expiryTime": 0,
                 "enable": True,
-                "subId": "main_sub"
+                "tgId": "",
+                "subId": "main_sub",
+                "comment": "",
+                "reset": 0,
+                "created_at": now_ms,
+                "updated_at": now_ms
             }],
-            "decryption": "none"
+            "decryption": "none",
+            "fallbacks": []
         }),
         "stream_settings": json.dumps({
             "network": "xhttp",
@@ -546,10 +603,11 @@ inbounds = [
             }
         }),
         "tag": "inbound-xhttp-up",
-        "sniffing": json.dumps({"enabled": True, "destOverride": ["http", "tls", "quic"]})
+        "sniffing": json.dumps({"enabled": True, "destOverride": ["http", "tls", "quic", "fakedns"], "metadataOnly": False, "routeOnly": False})
     },
     # Inbound 2: VLESS XHTTP Stream-One (127.0.0.1:7443) -> Домашний
     {
+        "id": 2,
         "user_id": 1,
         "up": 0,
         "down": 0,
@@ -560,15 +618,26 @@ inbounds = [
         "listen": "127.0.0.1",
         "port": 7443,
         "protocol": "vless",
+        "client_id": uuid_one,
+        "client_email": f"xhttp_one_{domain}",
         "settings": json.dumps({
             "clients": [{
                 "id": uuid_one,
                 "flow": "",
                 "email": f"xhttp_one_{domain}",
+                "limitIp": 0,
+                "totalGB": 0,
+                "expiryTime": 0,
                 "enable": True,
-                "subId": "main_sub"
+                "tgId": "",
+                "subId": "main_sub",
+                "comment": "",
+                "reset": 0,
+                "created_at": now_ms,
+                "updated_at": now_ms
             }],
-            "decryption": "none"
+            "decryption": "none",
+            "fallbacks": []
         }),
         "stream_settings": json.dumps({
             "network": "xhttp",
@@ -590,15 +659,22 @@ inbounds = [
             }
         }),
         "tag": "inbound-xhttp-one",
-        "sniffing": json.dumps({"enabled": True, "destOverride": ["http", "tls", "quic"]})
+        "sniffing": json.dumps({"enabled": True, "destOverride": ["http", "tls", "quic", "fakedns"], "metadataOnly": False, "routeOnly": False})
     }
 ]
 
 for ib in inbounds:
     cur.execute("""
-        INSERT INTO inbounds (user_id, up, down, total, remark, enable, expiry_time, listen, port, protocol, settings, stream_settings, tag, sniffing)
-        VALUES (:user_id, :up, :down, :total, :remark, :enable, :expiry_time, :listen, :port, :protocol, :settings, :stream_settings, :tag, :sniffing)
+        INSERT INTO inbounds (id, user_id, up, down, total, remark, enable, expiry_time, listen, port, protocol, settings, stream_settings, tag, sniffing)
+        VALUES (:id, :user_id, :up, :down, :total, :remark, :enable, :expiry_time, :listen, :port, :protocol, :settings, :stream_settings, :tag, :sniffing)
     """, ib)
+    try:
+        cur.execute("""
+            INSERT INTO client_traffics (inbound_id, enable, email, up, down, expiry_time, total, reset)
+            VALUES (?, 1, ?, 0, 0, 0, 0, 0)
+        """, (ib["id"], ib["client_email"]))
+    except sqlite3.OperationalError:
+        pass
 
 conn.commit()
 conn.close()
@@ -607,7 +683,7 @@ PYEOF
 rm -f /usr/local/x-ui/bin/config.json
 /usr/local/x-ui/x-ui setting -username "${PANEL_USER}" -password "${PANEL_PASS}" -port "${PANEL_PORT}" -webBasePath "/${PANEL_PATH}/" >/dev/null
 
-# 9. Формирование /etc/nginx/nginx.conf (прямой HTTP/2 на 443 порту)
+# 9. Формирование /etc/nginx/nginx.conf (прямой HTTP/2 на 443 порту + стандартный combined лог для Fail2Ban)
 log_info "Генерация /etc/nginx/nginx.conf..."
 cat <<EOF > /etc/nginx/nginx.conf
 user www-data;
@@ -661,8 +737,8 @@ http {
     proxy_cache_path /var/cache/nginx/img_cache levels=1:2 keys_zone=img_zone:10m max_size=1g inactive=7d use_temp_path=off;
     proxy_cache_path /var/cache/nginx/html_cache levels=1:2 keys_zone=html_zone:20m max_size=500m inactive=30d use_temp_path=off;
 
-    log_format main '\$remote_addr [\$time_local] "\$request" \$status \$body_bytes_sent "\$http_user_agent"';
-    access_log /var/log/nginx/access.log main buffer=32k flush=60s;
+    # Стандартный формат combined для 100% совместимости с фильтрами Fail2Ban и CrowdSec
+    access_log /var/log/nginx/access.log combined buffer=32k flush=5s;
 
     keepalive_timeout 75s;
     keepalive_requests 100000;
@@ -928,7 +1004,10 @@ sleep 2
 systemctl enable --now nginx
 systemctl restart x-ui nginx
 
-# 11. Настройка Fail2Ban (systemd для sshd + polling для файла лога nginx)
+# Дополнительная привязка certbot к webroot после запуска Nginx
+certbot reconfigure --cert-name "${DOMAIN}" --authenticator webroot --webroot-path /var/www/html --non-interactive >/dev/null 2>&1 || true
+
+# 11. Настройка Fail2Ban (systemd с явным journalmatch для ssh.service + polling для combined лога nginx)
 log_info "Настройка Fail2Ban..."
 cat <<EOF > /etc/fail2ban/jail.local
 [DEFAULT]
@@ -941,6 +1020,8 @@ banaction = nftables-multiport
 [sshd]
 enabled = true
 port = ${SSH_PORT}
+backend = systemd
+journalmatch = _SYSTEMD_UNIT=ssh.service + _COMM=sshd
 
 [nginx-botsearch]
 enabled = true
@@ -970,7 +1051,7 @@ sed -i "s|^mode:.*|mode: nftables|" /etc/crowdsec/bouncers/crowdsec-firewall-bou
 systemctl enable --now crowdsec crowdsec-firewall-bouncer
 systemctl restart crowdsec crowdsec-firewall-bouncer
 
-# 13. Подготовка генератора объединённой блокировки C24Be + CyberOK Skipa в nftables
+# 13. Подготовка генератора объединённой блокировки C24Be + CyberOK Skipa в nftables (исправленный URL skipa_cidr.txt)
 log_info "Подготовка модуля блокировки сканеров (C24Be AS_Network_List + CyberOK Skipa)..."
 cat <<'EOF' > /usr/local/sbin/update-scanners-blocklist.sh
 #!/usr/bin/env python3
@@ -988,8 +1069,8 @@ sources = {
         "https://raw.githubusercontent.com/C24Be/AS_Network_List/main/blacklists/blacklist-v4.txt"
     ],
     "CyberOK_Skipa_ips": [
-        "https://raw.githubusercontent.com/tread-lightly/CyberOK_Skipa_ips/main/lists/cidr.txt",
-        "https://raw.githubusercontent.com/tread-lightly/CyberOK_Skipa_ips/main/README.md"
+        "https://raw.githubusercontent.com/tread-lightly/CyberOK_Skipa_ips/main/lists/skipa_cidr.txt",
+        "https://raw.githubusercontent.com/tread-lightly/CyberOK_Skipa_ips/main/lists/skipa_ips.txt"
     ]
 }
 
@@ -1018,7 +1099,7 @@ for name, urls in sources.items():
     stats[name] = len(source_nets)
     valid_nets.update(source_nets)
 
-if len(valid_nets) < 500:
+if len(valid_nets) < 100:
     raise SystemExit(f"Error: too few valid CIDRs fetched ({len(valid_nets)}), aborting update.")
 
 collapsed = list(ipaddress.collapse_addresses(sorted(valid_nets)))
@@ -1072,11 +1153,14 @@ systemctl daemon-reload
 
 if [[ "$ENABLE_SCANNERS_BLOCK" =~ ^[Yy]$ ]]; then
     log_info "Загрузка и применение списков C24Be + CyberOK Skipa в nftables..."
-    /usr/local/sbin/update-scanners-blocklist.sh
-    systemctl enable scanners-blocklist.service >/dev/null
-    echo "15 4 * * * root /usr/local/sbin/update-scanners-blocklist.sh >/dev/null 2>&1" > /etc/cron.d/scanners-blocklist
-    chmod 644 /etc/cron.d/scanners-blocklist
-    log_ok "Объединённая блокировка C24Be + CyberOK Skipa активирована."
+    if /usr/local/sbin/update-scanners-blocklist.sh; then
+        systemctl enable scanners-blocklist.service >/dev/null
+        echo "15 4 * * * root /usr/local/sbin/update-scanners-blocklist.sh >/dev/null 2>&1" > /etc/cron.d/scanners-blocklist
+        chmod 644 /etc/cron.d/scanners-blocklist
+        log_ok "Объединённая блокировка C24Be + CyberOK Skipa активирована."
+    else
+        log_warn "Не удалось загрузить списки сканеров (проверьте связь с GitHub). Позже выполните: my3xui blocklist install"
+    fi
 fi
 
 # 14. Установка CLI-утилиты my3xui (/usr/local/bin/my3xui)
@@ -1181,16 +1265,28 @@ if sub_uri:
     print(f"  Единая подписка:         {sub_uri}main_sub")
 
 print("\n--- АКТИВНЫЕ КЛЮЧИ VLESS:// ---")
-for row in cur.execute("SELECT remark, settings, stream_settings FROM inbounds WHERE enable = 1"):
-    remark, st_raw, sst_raw = row
+for row in cur.execute("SELECT id, remark, settings, stream_settings FROM inbounds WHERE enable = 1"):
+    ib_id, remark, st_raw, sst_raw = row
     st = json.loads(st_raw)
     sst = json.loads(sst_raw)
     clients = st.get("clients", [])
-    if not clients:
+    uuid = None
+    if clients:
+        uuid = clients[0].get("id")
+    if not uuid:
+        try:
+            r_cl = cur.execute("""
+                SELECT c.id FROM clients c
+                JOIN client_inbounds ci ON ci.client_uid = c.uid
+                WHERE ci.inbound_id = ? LIMIT 1
+            """, (ib_id,)).fetchone()
+            if r_cl:
+                uuid = r_cl[0]
+        except Exception:
+            pass
+    if not uuid:
         continue
 
-    client = clients[0]
-    uuid = client["id"]
     net = sst.get("network", "xhttp")
     xs = sst.get("xhttpSettings", {})
 
