@@ -411,6 +411,11 @@ tpl["routing"] = {
     "rules": [
         {
             "type": "field",
+            "inboundTag": ["api"],
+            "outboundTag": "api"
+        },
+        {
+            "type": "field",
             "outboundTag": "blocked",
             "protocol": ["bittorrent"]
         },
