@@ -101,7 +101,7 @@ SUB_PATH=$(openssl rand -hex 12)
 XHTTP_UP_PATH="media/ts/$(openssl rand -hex 4)"
 XHTTP_ONE_PATH="media/ts/1080/$(openssl rand -hex 4)"
 
-# Надёжное определение порта SSH (sshd -T + ssh.socket + активная сессия $SSH_CONNECTION)
+# Надёжное определение порта SSH и IP текущей сессии администратора
 SSH_PORT=""
 if command -v sshd >/dev/null 2>&1; then
     SSH_PORT=$(sshd -T 2>/dev/null | awk '/^port / {print $2; exit}' || true)
@@ -114,6 +114,7 @@ if [[ -z "$SSH_PORT" ]]; then
 fi
 SSH_PORT=${SSH_PORT:-22}
 ACTIVE_SSH_PORT=$(awk '{print $4}' <<< "${SSH_CONNECTION:-}" 2>/dev/null || true)
+ADMIN_SSH_IP=$(awk '{print $1}' <<< "${SSH_CONNECTION:-}" 2>/dev/null || true)
 
 echo -e "\n${YELLOW}Сводка параметров перед установкой:${NC}"
 echo "  • Домен:          ${DOMAIN}"
@@ -230,7 +231,7 @@ if [[ -f "$RENEW_CONF" ]]; then
     if ! grep -q '^webroot_path' "$RENEW_CONF"; then
         sed -i '/^authenticator = webroot/a webroot_path = /var/www/html,' "$RENEW_CONF"
     fi
-    if ! grep -q '^\[webroot_map\]' "$RENEW_CONF"; then
+    if ! grep -q '^\[\[webroot_map\]\]' "$RENEW_CONF"; then
         printf "\n[[webroot_map]]\n%s = /var/www/html\n" "${DOMAIN}" >> "$RENEW_CONF"
     fi
 fi
@@ -570,7 +571,7 @@ inbounds = [
                 "totalGB": 0,
                 "expiryTime": 0,
                 "enable": True,
-                "tgId": "",
+                "tgId": 0,
                 "subId": "main_sub",
                 "comment": "",
                 "reset": 0,
@@ -629,7 +630,7 @@ inbounds = [
                 "totalGB": 0,
                 "expiryTime": 0,
                 "enable": True,
-                "tgId": "",
+                "tgId": 0,
                 "subId": "main_sub",
                 "comment": "",
                 "reset": 0,
@@ -1051,9 +1052,16 @@ sed -i "s|^mode:.*|mode: nftables|" /etc/crowdsec/bouncers/crowdsec-firewall-bou
 systemctl enable --now crowdsec crowdsec-firewall-bouncer
 systemctl restart crowdsec crowdsec-firewall-bouncer
 
-# 13. Подготовка генератора объединённой блокировки C24Be + CyberOK Skipa в nftables (исправленный URL skipa_cidr.txt)
+# 13. Подготовка генератора объединённой блокировки C24Be + CyberOK Skipa в nftables (с защитой SSH и белым списком IP)
 log_info "Подготовка модуля блокировки сканеров (C24Be AS_Network_List + CyberOK Skipa)..."
-cat <<'EOF' > /usr/local/sbin/update-scanners-blocklist.sh
+mkdir -p /etc/nftables.d
+touch /etc/nftables.d/whitelist_ips.txt
+if [[ -n "$ADMIN_SSH_IP" ]]; then
+    echo "$ADMIN_SSH_IP" >> /etc/nftables.d/whitelist_ips.txt
+    sort -u /etc/nftables.d/whitelist_ips.txt -o /etc/nftables.d/whitelist_ips.txt
+fi
+
+cat <<EOF > /usr/local/sbin/update-scanners-blocklist.sh
 #!/usr/bin/env python3
 import os
 import re
@@ -1062,6 +1070,8 @@ import urllib.request
 import subprocess
 
 NFT_FILE = "/etc/nftables.d/scanners_block.nft"
+WL_FILE = "/etc/nftables.d/whitelist_ips.txt"
+SSH_PORT = ${SSH_PORT}
 os.makedirs("/etc/nftables.d", exist_ok=True)
 
 sources = {
@@ -1105,6 +1115,23 @@ if len(valid_nets) < 100:
 collapsed = list(ipaddress.collapse_addresses(sorted(valid_nets)))
 elements = ",\n        ".join(str(net) for net in collapsed)
 
+wl_ips = set()
+if os.path.exists(WL_FILE):
+    with open(WL_FILE, "r", encoding="utf-8") as wf:
+        for line in wf:
+            line = line.strip()
+            try:
+                ip = ipaddress.ip_address(line)
+                if ip.version == 4:
+                    wl_ips.add(str(ip))
+            except ValueError:
+                pass
+
+wl_rule = ""
+if wl_ips:
+    wl_elems = ", ".join(sorted(wl_ips))
+    wl_rule = f"        ip saddr {{ {wl_elems} }} accept\n"
+
 nft_config = f"""# Sources: C24Be={stats.get('C24Be_AS_Network_List', 0)}, CyberOK={stats.get('CyberOK_Skipa_ips', 0)}, Collapsed={len(collapsed)}
 table inet scanners_block
 delete table inet scanners_block
@@ -1122,7 +1149,8 @@ table inet scanners_block {{
     chain prerouting {{
         type filter hook prerouting priority -150; policy accept;
         ct state established,related accept
-        ip saddr @scanners_v4 counter drop
+        tcp dport {SSH_PORT} accept
+{wl_rule}        ip saddr @scanners_v4 counter drop
     }}
 }}
 """
@@ -1332,6 +1360,12 @@ blocklist_status() {
 
 blocklist_install() {
     echo -e "${CYAN}[INFO] Загрузка и установка списков C24Be + CyberOK Skipa (сжатие Collapsed)...${NC}"
+    CURRENT_IP=$(awk '{print $1}' <<< "${SSH_CONNECTION:-}" 2>/dev/null || true)
+    if [[ -n "$CURRENT_IP" ]]; then
+        mkdir -p /etc/nftables.d
+        echo "$CURRENT_IP" >> /etc/nftables.d/whitelist_ips.txt
+        sort -u /etc/nftables.d/whitelist_ips.txt -o /etc/nftables.d/whitelist_ips.txt
+    fi
     /usr/local/sbin/update-scanners-blocklist.sh
     systemctl enable scanners-blocklist.service >/dev/null 2>&1 || true
     echo "15 4 * * * root /usr/local/sbin/update-scanners-blocklist.sh >/dev/null 2>&1" > /etc/cron.d/scanners-blocklist
@@ -1341,6 +1375,12 @@ blocklist_install() {
 
 blocklist_update() {
     echo -e "${CYAN}[INFO] Обновление списков C24Be + CyberOK Skipa...${NC}"
+    CURRENT_IP=$(awk '{print $1}' <<< "${SSH_CONNECTION:-}" 2>/dev/null || true)
+    if [[ -n "$CURRENT_IP" ]]; then
+        mkdir -p /etc/nftables.d
+        echo "$CURRENT_IP" >> /etc/nftables.d/whitelist_ips.txt
+        sort -u /etc/nftables.d/whitelist_ips.txt -o /etc/nftables.d/whitelist_ips.txt
+    fi
     /usr/local/sbin/update-scanners-blocklist.sh
     echo -e "${GREEN}[OK] Списки успешно обновлены и применены в nftables.${NC}"
 }
@@ -1429,7 +1469,8 @@ clean_server() {
     systemctl disable scanners-blocklist.service skipa-blocklist.service 2>/dev/null || true
     nft delete table inet scanners_block 2>/dev/null || true
     nft delete table inet skipa_block 2>/dev/null || true
-    rm -f /etc/nftables.d/scanners_block.nft /usr/local/sbin/update-scanners-blocklist.sh \
+    rm -f /etc/nftables.d/scanners_block.nft /etc/nftables.d/whitelist_ips.txt \
+          /usr/local/sbin/update-scanners-blocklist.sh \
           /etc/systemd/system/scanners-blocklist.service /etc/cron.d/scanners-blocklist \
           /etc/nftables.d/skipa_block.nft /usr/local/sbin/update-skipa-blocklist.sh \
           /etc/systemd/system/skipa-blocklist.service /etc/cron.d/skipa-blocklist
