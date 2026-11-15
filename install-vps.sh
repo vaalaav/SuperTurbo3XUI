@@ -3,7 +3,7 @@ set -eu
 
 # ============================================================================
 # Интерактивный установщик 3x-ui 3.11+ + Nginx HTTP/2 XHTTP + Security Stack
-# Инбаунды: XHTTP Packet-UP ("Мобилы") + Stream-One ("Домашний") + анти-ТСПУ
+# Инбаунды: XHTTP Packet-UP ("Мобилы") + Stream-One ("Домашний") без клиентов
 # Маршрутизация: api->api, блокировка BitTorrent, Private IPs, Ads, Malware
 # Поддержка: Ubuntu 24.04 / 26.04 LTS | Маска: iqubik/myfakesite / Reverse Proxy
 # Защита: UFW + Fail2Ban + CrowdSec + C24Be AS_Network_List + CyberOK_Skipa_ips
@@ -101,7 +101,7 @@ SUB_PATH=$(openssl rand -hex 12)
 XHTTP_UP_PATH="media/ts/$(openssl rand -hex 4)"
 XHTTP_ONE_PATH="media/ts/1080/$(openssl rand -hex 4)"
 
-# Надёжное определение порта SSH (sshd -T + ssh.socket + активная сессия $SSH_CONNECTION)
+# Надёжное определение порта SSH и IP текущей сессии администратора
 SSH_PORT=""
 if command -v sshd >/dev/null 2>&1; then
     SSH_PORT=$(sshd -T 2>/dev/null | awk '/^port / {print $2; exit}' || true)
@@ -114,10 +114,11 @@ if [[ -z "$SSH_PORT" ]]; then
 fi
 SSH_PORT=${SSH_PORT:-22}
 ACTIVE_SSH_PORT=$(awk '{print $4}' <<< "${SSH_CONNECTION:-}" 2>/dev/null || true)
+ADMIN_SSH_IP=$(awk '{print $1}' <<< "${SSH_CONNECTION:-}" 2>/dev/null || true)
 
 echo -e "\n${YELLOW}Сводка параметров перед установкой:${NC}"
 echo "  • Домен:          ${DOMAIN}"
-echo "  • Протоколы:      XHTTP Packet-UP («Мобилы») + XHTTP Stream-One («Домашний»)"
+echo "  • Инбаунды:       XHTTP Packet-UP («Мобилы») + XHTTP Stream-One («Домашний») [без клиентов]"
 echo "  • Роутинг Xray:   api->api + блокировка BitTorrent, Private IPs, Ads, Malware/Phishing"
 echo "  • Маскировка:     ${REVERSE_PROXY_URL:-Локальный сайт iqubik/myfakesite}"
 echo "  • Порт панели:    127.0.0.1:${PANEL_PORT} (путь /${PANEL_PATH}/)"
@@ -230,7 +231,7 @@ if [[ -f "$RENEW_CONF" ]]; then
     if ! grep -q '^webroot_path' "$RENEW_CONF"; then
         sed -i '/^authenticator = webroot/a webroot_path = /var/www/html,' "$RENEW_CONF"
     fi
-    if ! grep -q '^\[webroot_map\]' "$RENEW_CONF"; then
+    if ! grep -q '^\[\[webroot_map\]\]' "$RENEW_CONF"; then
         printf "\n[[webroot_map]]\n%s = /var/www/html\n" "${DOMAIN}" >> "$RENEW_CONF"
     fi
 fi
@@ -321,7 +322,7 @@ EOF
 
 chown -R www-data:www-data /var/cache/nginx /var/www /var/log/nginx
 
-# 8. Установка 3x-ui, загрузка расширенных баз geosite и патчинг /etc/x-ui/x-ui.db
+# 8. Установка 3x-ui, загрузка расширенных баз geosite и патчинг /etc/x-ui/x-ui.db (без создания пользователей)
 log_info "Установка панели 3x-ui..."
 bash <(curl -Ls https://raw.githubusercontent.com/MHSanaei/3x-ui/master/install.sh) <<EOF
 n
@@ -332,32 +333,24 @@ log_info "Загрузка баз geosite_IR.dat и geosite_RU.dat для фил
 curl -fsSL "https://github.com/chocolate4u/Iran-v2ray-rules/releases/latest/download/geosite.dat" -o /usr/local/x-ui/bin/geosite_IR.dat || log_warn "Не удалось скачать geosite_IR.dat"
 curl -fsSL "https://github.com/runetfreedom/russia-v2ray-rules-dat/releases/latest/download/geosite.dat" -o /usr/local/x-ui/bin/geosite_RU.dat || log_warn "Не удалось скачать geosite_RU.dat"
 
-log_info "Определение геолокации IP сервера, генерация UUID, настройка роутинга и патчинг базы 3x-ui..."
-XRAY_BIN=$(find /usr/local/x-ui/bin -name "xray-linux-*" | head -n 1)
-[[ -z "$XRAY_BIN" ]] && log_err "Бинарный файл Xray не найден в /usr/local/x-ui/bin!"
-
-UUID_XHTTP_UP=$("$XRAY_BIN" uuid)
-UUID_XHTTP_ONE=$("$XRAY_BIN" uuid)
+log_info "Определение геолокации IP сервера, настройка роутинга и создание чистых инбаундов в 3x-ui..."
+/usr/local/x-ui/x-ui setting -username "${PANEL_USER}" -password "${PANEL_PASS}" -port "${PANEL_PORT}" -webBasePath "/${PANEL_PATH}/" >/dev/null
 
 DOMAIN="$DOMAIN" \
 PANEL_PORT="$PANEL_PORT" \
 PANEL_PATH="$PANEL_PATH" \
 SUB_PORT="$SUB_PORT" \
 SUB_PATH="$SUB_PATH" \
-UUID_XHTTP_UP="$UUID_XHTTP_UP" \
-UUID_XHTTP_ONE="$UUID_XHTTP_ONE" \
 XHTTP_UP_PATH="$XHTTP_UP_PATH" \
 XHTTP_ONE_PATH="$XHTTP_ONE_PATH" \
 python3 - <<'PYEOF'
-import sqlite3, json, urllib.request, os, time
+import sqlite3, json, urllib.request, os
 
 domain = os.environ["DOMAIN"]
 panel_port = os.environ["PANEL_PORT"]
 panel_path = os.environ["PANEL_PATH"]
 sub_port = os.environ["SUB_PORT"]
 sub_path = os.environ["SUB_PATH"]
-uuid_up = os.environ["UUID_XHTTP_UP"]
-uuid_one = os.environ["UUID_XHTTP_ONE"]
 xhttp_up_path = os.environ["XHTTP_UP_PATH"]
 xhttp_one_path = os.environ["XHTTP_ONE_PATH"]
 
@@ -530,9 +523,8 @@ if row:
 else:
     cur.execute("INSERT INTO settings (key, value) VALUES ('xrayTemplateConfig', ?)", (tpl_val,))
 
-# Очистка старых таблиц клиентов и инбаундов + сброс флага сидера ClientsTable,
-# чтобы при запуске 3x-ui 3.11+ сама мигрировала клиентов из inbounds.settings в таблицы clients и client_inbounds
-for tbl in ("inbounds", "client_traffics", "client_inbounds", "clients", "seeders"):
+# Очистка таблиц инбаундов и клиентов (инбаунды создаются без пользователей)
+for tbl in ("inbounds", "client_traffics", "client_inbounds", "clients"):
     try:
         cur.execute(f"DELETE FROM {tbl}")
     except sqlite3.OperationalError:
@@ -543,10 +535,8 @@ browser_headers = {
     "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7"
 }
 
-now_ms = int(time.time() * 1000)
-
 inbounds = [
-    # Inbound 1: VLESS XHTTP Packet-UP (127.0.0.1:11443) -> Мобилы
+    # Inbound 1: VLESS XHTTP Packet-UP (127.0.0.1:11443) -> Мобилы (без клиентов)
     {
         "id": 1,
         "user_id": 1,
@@ -559,24 +549,8 @@ inbounds = [
         "listen": "127.0.0.1",
         "port": 11443,
         "protocol": "vless",
-        "client_id": uuid_up,
-        "client_email": f"xhttp_up_{domain}",
         "settings": json.dumps({
-            "clients": [{
-                "id": uuid_up,
-                "flow": "",
-                "email": f"xhttp_up_{domain}",
-                "limitIp": 0,
-                "totalGB": 0,
-                "expiryTime": 0,
-                "enable": True,
-                "tgId": "",
-                "subId": "main_sub",
-                "comment": "",
-                "reset": 0,
-                "created_at": now_ms,
-                "updated_at": now_ms
-            }],
+            "clients": [],
             "decryption": "none",
             "fallbacks": []
         }),
@@ -605,7 +579,7 @@ inbounds = [
         "tag": "inbound-xhttp-up",
         "sniffing": json.dumps({"enabled": True, "destOverride": ["http", "tls", "quic", "fakedns"], "metadataOnly": False, "routeOnly": False})
     },
-    # Inbound 2: VLESS XHTTP Stream-One (127.0.0.1:7443) -> Домашний
+    # Inbound 2: VLESS XHTTP Stream-One (127.0.0.1:7443) -> Домашний (без клиентов)
     {
         "id": 2,
         "user_id": 1,
@@ -618,24 +592,8 @@ inbounds = [
         "listen": "127.0.0.1",
         "port": 7443,
         "protocol": "vless",
-        "client_id": uuid_one,
-        "client_email": f"xhttp_one_{domain}",
         "settings": json.dumps({
-            "clients": [{
-                "id": uuid_one,
-                "flow": "",
-                "email": f"xhttp_one_{domain}",
-                "limitIp": 0,
-                "totalGB": 0,
-                "expiryTime": 0,
-                "enable": True,
-                "tgId": "",
-                "subId": "main_sub",
-                "comment": "",
-                "reset": 0,
-                "created_at": now_ms,
-                "updated_at": now_ms
-            }],
+            "clients": [],
             "decryption": "none",
             "fallbacks": []
         }),
@@ -668,20 +626,12 @@ for ib in inbounds:
         INSERT INTO inbounds (id, user_id, up, down, total, remark, enable, expiry_time, listen, port, protocol, settings, stream_settings, tag, sniffing)
         VALUES (:id, :user_id, :up, :down, :total, :remark, :enable, :expiry_time, :listen, :port, :protocol, :settings, :stream_settings, :tag, :sniffing)
     """, ib)
-    try:
-        cur.execute("""
-            INSERT INTO client_traffics (inbound_id, enable, email, up, down, expiry_time, total, reset)
-            VALUES (?, 1, ?, 0, 0, 0, 0, 0)
-        """, (ib["id"], ib["client_email"]))
-    except sqlite3.OperationalError:
-        pass
 
 conn.commit()
 conn.close()
 PYEOF
 
 rm -f /usr/local/x-ui/bin/config.json
-/usr/local/x-ui/x-ui setting -username "${PANEL_USER}" -password "${PANEL_PASS}" -port "${PANEL_PORT}" -webBasePath "/${PANEL_PATH}/" >/dev/null
 
 # 9. Формирование /etc/nginx/nginx.conf (прямой HTTP/2 на 443 порту + стандартный combined лог для Fail2Ban)
 log_info "Генерация /etc/nginx/nginx.conf..."
@@ -895,7 +845,7 @@ http {
             add_header Cache-Control "no-store, no-cache, must-revalidate";
         }
 
-        # Единая подписка 3x-ui
+        # Сервис подписок 3x-ui
         location ^~ /${SUB_PATH}/ {
             proxy_pass https://127.0.0.1:${SUB_PORT}/${SUB_PATH}/;
             proxy_ssl_verify off;
@@ -1051,9 +1001,16 @@ sed -i "s|^mode:.*|mode: nftables|" /etc/crowdsec/bouncers/crowdsec-firewall-bou
 systemctl enable --now crowdsec crowdsec-firewall-bouncer
 systemctl restart crowdsec crowdsec-firewall-bouncer
 
-# 13. Подготовка генератора объединённой блокировки C24Be + CyberOK Skipa в nftables (исправленный URL skipa_cidr.txt)
+# 13. Подготовка генератора объединённой блокировки C24Be + CyberOK Skipa в nftables (с защитой SSH и белым списком IP)
 log_info "Подготовка модуля блокировки сканеров (C24Be AS_Network_List + CyberOK Skipa)..."
-cat <<'EOF' > /usr/local/sbin/update-scanners-blocklist.sh
+mkdir -p /etc/nftables.d
+touch /etc/nftables.d/whitelist_ips.txt
+if [[ -n "$ADMIN_SSH_IP" ]]; then
+    echo "$ADMIN_SSH_IP" >> /etc/nftables.d/whitelist_ips.txt
+    sort -u /etc/nftables.d/whitelist_ips.txt -o /etc/nftables.d/whitelist_ips.txt
+fi
+
+cat <<EOF > /usr/local/sbin/update-scanners-blocklist.sh
 #!/usr/bin/env python3
 import os
 import re
@@ -1062,6 +1019,8 @@ import urllib.request
 import subprocess
 
 NFT_FILE = "/etc/nftables.d/scanners_block.nft"
+WL_FILE = "/etc/nftables.d/whitelist_ips.txt"
+SSH_PORT = ${SSH_PORT}
 os.makedirs("/etc/nftables.d", exist_ok=True)
 
 sources = {
@@ -1105,6 +1064,23 @@ if len(valid_nets) < 100:
 collapsed = list(ipaddress.collapse_addresses(sorted(valid_nets)))
 elements = ",\n        ".join(str(net) for net in collapsed)
 
+wl_ips = set()
+if os.path.exists(WL_FILE):
+    with open(WL_FILE, "r", encoding="utf-8") as wf:
+        for line in wf:
+            line = line.strip()
+            try:
+                ip = ipaddress.ip_address(line)
+                if ip.version == 4:
+                    wl_ips.add(str(ip))
+            except ValueError:
+                pass
+
+wl_rule = ""
+if wl_ips:
+    wl_elems = ", ".join(sorted(wl_ips))
+    wl_rule = f"        ip saddr {{ {wl_elems} }} accept\n"
+
 nft_config = f"""# Sources: C24Be={stats.get('C24Be_AS_Network_List', 0)}, CyberOK={stats.get('CyberOK_Skipa_ips', 0)}, Collapsed={len(collapsed)}
 table inet scanners_block
 delete table inet scanners_block
@@ -1122,7 +1098,8 @@ table inet scanners_block {{
     chain prerouting {{
         type filter hook prerouting priority -150; policy accept;
         ct state established,related accept
-        ip saddr @scanners_v4 counter drop
+        tcp dport {SSH_PORT} accept
+{wl_rule}        ip saddr @scanners_v4 counter drop
     }}
 }}
 """
@@ -1222,9 +1199,9 @@ show_sysinfo() {
 }
 
 show_creds() {
-    echo -e "\n${BOLD}${CYAN}=== ДАННЫЕ ДЛЯ ВХОДА В ПАНЕЛЬ И ССЫЛКИ (ИЗ БАЗЫ 3X-UI) ===${NC}"
+    echo -e "\n${BOLD}${CYAN}=== ДАННЫЕ ДЛЯ ВХОДА В ПАНЕЛЬ 3X-UI ===${NC}"
     python3 - <<'DBEOF'
-import sqlite3, json, urllib.parse, os
+import sqlite3, urllib.parse, os
 
 db_path = "/etc/x-ui/x-ui.db"
 if not os.path.exists(db_path):
@@ -1265,58 +1242,10 @@ if plain_pwd:
     print(f"  Пароль:                  {plain_pwd}")
 else:
     print("  Пароль:                  [зашифрован bcrypt в БД] (сброс: /usr/local/x-ui/x-ui setting -password НОВЫЙ_ПАРОЛЬ)")
-if sub_uri:
-    print(f"  Единая подписка:         {sub_uri}main_sub")
 
-print("\n--- АКТИВНЫЕ КЛЮЧИ VLESS:// ---")
-for row in cur.execute("SELECT id, remark, settings, stream_settings FROM inbounds WHERE enable = 1"):
-    ib_id, remark, st_raw, sst_raw = row
-    st = json.loads(st_raw)
-    sst = json.loads(sst_raw)
-    clients = st.get("clients", [])
-    uuid = None
-    if clients:
-        uuid = clients[0].get("id")
-    if not uuid:
-        try:
-            r_cl = cur.execute("""
-                SELECT c.id FROM clients c
-                JOIN client_inbounds ci ON ci.client_uid = c.uid
-                WHERE ci.inbound_id = ? LIMIT 1
-            """, (ib_id,)).fetchone()
-            if r_cl:
-                uuid = r_cl[0]
-        except Exception:
-            pass
-    if not uuid:
-        continue
-
-    net = sst.get("network", "xhttp")
-    xs = sst.get("xhttpSettings", {})
-
-    params = {
-        "type": net,
-        "encryption": "none",
-        "security": "tls",
-        "sni": domain,
-        "host": xs.get("host", domain),
-        "path": xs.get("path", "/"),
-        "mode": xs.get("mode", "auto"),
-        "fp": "randomized"
-    }
-
-    extra_keys = [
-        "noGRPCHeader", "xPaddingBytes", "scMaxEachPostBytes",
-        "scMinPostsIntervalMs", "scMaxBufferedPosts", "scStreamUpServerSecs", "headers"
-    ]
-    extra_obj = {k: xs[k] for k in extra_keys if k in xs}
-    if extra_obj:
-        params["extra"] = json.dumps(extra_obj, separators=(",", ":"))
-
-    query_str = urllib.parse.urlencode(params, quote_via=urllib.parse.quote)
-    link = f"vless://{uuid}@{domain}:443?{query_str}#{urllib.parse.quote(remark)}"
-    print(f"\n[{remark}]")
-    print(link)
+print("\n  Созданные инбаунды (пользователи добавляются вручную в панели):")
+for remark, port in cur.execute("SELECT remark, port FROM inbounds WHERE enable = 1"):
+    print(f"    • {remark} (локальный порт 127.0.0.1:{port})")
 
 conn.close()
 DBEOF
@@ -1336,6 +1265,12 @@ blocklist_status() {
 
 blocklist_install() {
     echo -e "${CYAN}[INFO] Загрузка и установка списков C24Be + CyberOK Skipa (сжатие Collapsed)...${NC}"
+    CURRENT_IP=$(awk '{print $1}' <<< "${SSH_CONNECTION:-}" 2>/dev/null || true)
+    if [[ -n "$CURRENT_IP" ]]; then
+        mkdir -p /etc/nftables.d
+        echo "$CURRENT_IP" >> /etc/nftables.d/whitelist_ips.txt
+        sort -u /etc/nftables.d/whitelist_ips.txt -o /etc/nftables.d/whitelist_ips.txt
+    fi
     /usr/local/sbin/update-scanners-blocklist.sh
     systemctl enable scanners-blocklist.service >/dev/null 2>&1 || true
     echo "15 4 * * * root /usr/local/sbin/update-scanners-blocklist.sh >/dev/null 2>&1" > /etc/cron.d/scanners-blocklist
@@ -1345,6 +1280,12 @@ blocklist_install() {
 
 blocklist_update() {
     echo -e "${CYAN}[INFO] Обновление списков C24Be + CyberOK Skipa...${NC}"
+    CURRENT_IP=$(awk '{print $1}' <<< "${SSH_CONNECTION:-}" 2>/dev/null || true)
+    if [[ -n "$CURRENT_IP" ]]; then
+        mkdir -p /etc/nftables.d
+        echo "$CURRENT_IP" >> /etc/nftables.d/whitelist_ips.txt
+        sort -u /etc/nftables.d/whitelist_ips.txt -o /etc/nftables.d/whitelist_ips.txt
+    fi
     /usr/local/sbin/update-scanners-blocklist.sh
     echo -e "${GREEN}[OK] Списки успешно обновлены и применены в nftables.${NC}"
 }
@@ -1433,7 +1374,8 @@ clean_server() {
     systemctl disable scanners-blocklist.service skipa-blocklist.service 2>/dev/null || true
     nft delete table inet scanners_block 2>/dev/null || true
     nft delete table inet skipa_block 2>/dev/null || true
-    rm -f /etc/nftables.d/scanners_block.nft /usr/local/sbin/update-scanners-blocklist.sh \
+    rm -f /etc/nftables.d/scanners_block.nft /etc/nftables.d/whitelist_ips.txt \
+          /usr/local/sbin/update-scanners-blocklist.sh \
           /etc/systemd/system/scanners-blocklist.service /etc/cron.d/scanners-blocklist \
           /etc/nftables.d/skipa_block.nft /usr/local/sbin/update-skipa-blocklist.sh \
           /etc/systemd/system/skipa-blocklist.service /etc/cron.d/skipa-blocklist
@@ -1465,7 +1407,7 @@ case "${1:-}" in
             echo -e "${BOLD}   Управление сервером (my3xui CLI)               ${NC}"
             echo -e "${BOLD}${CYAN}==================================================${NC}"
             echo "  1. Информация о системе (CPU, RAM, тип и размер дисков)"
-            echo "  2. Данные для входа в панель 3x-ui и ссылки VLESS"
+            echo "  2. Данные для входа в панель 3x-ui"
             echo "  3. Состояние CrowdSec и активных блокировок"
             echo "  4. Блокировка сканеров (установить / обновить / удалить C24Be + CyberOK)"
             echo -e "  5. ${RED}Очистка сервера (полное удаление всех компонентов)${NC}"
@@ -1487,16 +1429,17 @@ esac
 EOF
 chmod +x /usr/local/bin/my3xui
 
-# 15. Сохранение резервной копии учетных данных и финальный вывод
+# 15. Сохранение резервной копии учетных данных и финальный вывод (без пользователей и ссылок подписки)
 INFO_FILE="/root/vps-credentials.txt"
-printf "Ссылка на панель 3x-ui:  https://%s/%s/\nЛогин:                   %s\nПароль:                  %s\nЕдиная подписка:         https://%s/%s/main_sub\n" \
-    "${DOMAIN}" "${PANEL_PATH}" "${PANEL_USER}" "${PANEL_PASS}" "${DOMAIN}" "${SUB_PATH}" > "$INFO_FILE"
+printf "Ссылка на панель 3x-ui:  https://%s/%s/\nЛогин:                   %s\nПароль:                  %s\n" \
+    "${DOMAIN}" "${PANEL_PATH}" "${PANEL_USER}" "${PANEL_PASS}" > "$INFO_FILE"
 chmod 600 "$INFO_FILE"
 
 echo -e "\n${GREEN}${BOLD}=================================================================${NC}"
 echo -e "${GREEN}${BOLD}  УСТАНОВКА УСПЕШНО ЗАВЕРШЕНА!                                   ${NC}"
 echo -e "${GREEN}${BOLD}=================================================================${NC}"
-echo -e "  • Протоколы:     XHTTP Packet-UP («Мобилы») + XHTTP Stream-One («Домашний»)"
+echo -e "  • Инбаунды:      XHTTP Packet-UP («Мобилы») + XHTTP Stream-One («Домашний»)"
+echo -e "  • Пользователи:  не создавались (добавьте их в веб-панели 3x-ui)"
 echo -e "  • Роутинг Xray:  api->api + блокировка BitTorrent, Private IPs, Ads, Malware/Phishing"
 echo -e "  • UFW:           активен (открыты только SSH:${SSH_PORT}, 80, 443)"
 echo -e "  • Fail2Ban:      активен (sshd + nginx-botsearch через nftables)"
