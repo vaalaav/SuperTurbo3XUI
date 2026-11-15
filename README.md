@@ -17,7 +17,7 @@
 
 ## 🚀 Быстрый старт
 
-Подключитесь к чистому серверу **Ubuntu 24.04** или **26.04 LTS** под пользователем `root` и выполните:
+Подключитесь к чистому серверу **Ubuntu 24.04** под пользователем `root` и выполните:
 
 ~~~bash
 curl -fsSL https://raw.githubusercontent.com/vaalaav/SuperTurbo3XUI/main/install-vps.sh -o /root/install-vps.sh && bash /root/install-vps.sh
