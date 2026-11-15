@@ -1234,21 +1234,24 @@ cat <<'EOF' > /etc/systemd/system/scanners-blocklist.service
 Description=Apply C24Be AS_Network_List & CyberOK Skipa nftables blocklist
 After=network-online.target nftables.service ufw.service
 Wants=network-online.target
+PartOf=nftables.service ufw.service
 
 [Service]
 Type=oneshot
+ExecStartPre=/bin/sh -c '[ -s /etc/nftables.d/scanners_block.nft ] || /usr/local/sbin/update-scanners-blocklist.sh'
 ExecStart=/usr/sbin/nft -f /etc/nftables.d/scanners_block.nft
+ExecReload=/usr/sbin/nft -f /etc/nftables.d/scanners_block.nft
 RemainAfterExit=yes
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=multi-user.target nftables.service ufw.service
 EOF
 systemctl daemon-reload
 
 if [[ "$ENABLE_SCANNERS_BLOCK" =~ ^[Yy]$ ]]; then
     log_info "Загрузка и применение списков C24Be + CyberOK Skipa в nftables..."
     if /usr/local/sbin/update-scanners-blocklist.sh; then
-        systemctl enable scanners-blocklist.service >/dev/null
+        systemctl enable --now scanners-blocklist.service >/dev/null
         cat <<'CRON_EOF' > /etc/cron.d/scanners-blocklist
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 15 4 * * * root /usr/local/sbin/update-scanners-blocklist.sh >/dev/null 2>&1
@@ -1392,7 +1395,7 @@ blocklist_install() {
         sort -u /etc/nftables.d/whitelist_ips.txt -o /etc/nftables.d/whitelist_ips.txt
     fi
     /usr/local/sbin/update-scanners-blocklist.sh
-    systemctl enable scanners-blocklist.service >/dev/null 2>&1 || true
+    systemctl enable --now scanners-blocklist.service >/dev/null 2>&1 || true
     cat <<'CRON_EOF' > /etc/cron.d/scanners-blocklist
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 15 4 * * * root /usr/local/sbin/update-scanners-blocklist.sh >/dev/null 2>&1
@@ -1410,6 +1413,7 @@ blocklist_update() {
         sort -u /etc/nftables.d/whitelist_ips.txt -o /etc/nftables.d/whitelist_ips.txt
     fi
     /usr/local/sbin/update-scanners-blocklist.sh
+    systemctl start scanners-blocklist.service >/dev/null 2>&1 || true
     echo -e "${GREEN}[OK] Списки успешно обновлены и применены в nftables.${NC}"
 }
 
