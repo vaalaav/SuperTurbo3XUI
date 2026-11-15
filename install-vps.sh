@@ -687,17 +687,21 @@ inbounds = [
     }
 ]
 
+table_cols = cur.execute("PRAGMA table_info(inbounds)").fetchall()
 for ib in inbounds:
-    cur.execute("""
-        INSERT INTO inbounds (
-            id, user_id, up, down, total, remark, enable, expiry_time,
-            listen, port, protocol, settings, stream_settings, tag, sniffing, allocate
-        )
-        VALUES (
-            :id, :user_id, :up, :down, :total, :remark, :enable, :expiry_time,
-            :listen, :port, :protocol, :settings, :stream_settings, :tag, :sniffing, :allocate
-        )
-    """, ib)
+    valid_ib = {}
+    for cid, col_name, col_type, notnull, dflt_value, pk in table_cols:
+        if col_name in ib:
+            valid_ib[col_name] = ib[col_name]
+        elif pk == 0 and dflt_value is None:
+            ctype = (col_type or "").upper()
+            if any(t in ctype for t in ("INT", "BOOL", "NUM", "REAL")):
+                valid_ib[col_name] = 0
+            else:
+                valid_ib[col_name] = ""
+    cols_sql = ", ".join(valid_ib.keys())
+    vals_sql = ", ".join(f":{k}" for k in valid_ib.keys())
+    cur.execute(f"INSERT INTO inbounds ({cols_sql}) VALUES ({vals_sql})", valid_ib)
 
 conn.commit()
 conn.close()
