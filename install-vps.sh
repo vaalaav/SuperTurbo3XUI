@@ -670,7 +670,7 @@ inbounds = [
         "sniffing": default_sniffing,
         "allocate": default_allocate
     },
-    # Inbound 2: VLESS XHTTP Stream-One (127.0.0.1:7443) -> Домашний (без клиентов)
+    # Inbound 2: VLESS XHTTP  (127.0.0.1:7443) -> Домашний (без клиентов)
     {
         "id": 2,
         "user_id": 1,
@@ -701,9 +701,8 @@ inbounds = [
                 "path": f"/{xhttp_one_path}/",
                 "host": domain,
                 "mode": "stream-one",
-                "noGRPCHeader": True,
+                "noGRPCHeader": false,
                 "xPaddingBytes": "100-1000",
-                "scStreamUpServerSecs": "30-120",
                 "headers": browser_headers
             }
         }),
@@ -1058,28 +1057,19 @@ http {
 
         # Inbound 2: VLESS XHTTP Stream-One (Домашний)
         location ^~ /${XHTTP_ONE_PATH}/ {
-            set \$limit_ip "";
+         set \$limit_ip "";
 
-            proxy_pass http://xray_xhttp_one;
-            proxy_http_version 1.1;
-            proxy_set_header Connection "";
-            proxy_buffering off;
-            proxy_request_buffering off;
-            gzip off;
-            proxy_set_header Host \$host;
-            proxy_set_header X-Real-IP \$remote_addr;
-            proxy_set_header X-Forwarded-For \$remote_addr;
-            proxy_set_header X-Forwarded-Proto \$scheme;
-            proxy_read_timeout 1h;
-            proxy_send_timeout 1h;
-            client_body_timeout 1h;
-            send_timeout 1h;
-            proxy_socket_keepalive on;
-            proxy_next_upstream off;
-            client_max_body_size 0;
-            proxy_max_temp_file_size 0;
-            access_log off;
-            error_log /dev/null crit;
+         grpc_pass grpc://xray_xhttp_one;
+         grpc_set_header Host \$host;
+         grpc_set_header X-Real-IP \$remote_addr;
+         grpc_set_header X-Forwarded-For \$remote_addr;
+         grpc_read_timeout 1h;
+         grpc_send_timeout 1h;
+         grpc_socket_keepalive on;
+         client_body_timeout 1h;
+         client_max_body_size 0;
+         access_log off;
+         error_log /dev/null crit;
         }
 
 ${MASK_LOCATION_BLOCK}
