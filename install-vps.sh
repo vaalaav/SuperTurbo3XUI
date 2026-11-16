@@ -779,18 +779,16 @@ inbounds.append({
     "allocate": default_allocate
 })
 
-table_cols = cur.execute("PRAGMA table_info(inbounds)").fetchall()
+extra_defaults = {
+    "all_time": 0,
+    "traffic_reset": "never",
+    "last_traffic_reset_time": 0,
+    "node_id": None
+}
+existing_cols = {row[1] for row in cur.execute("PRAGMA table_info(inbounds)").fetchall()}
 for ib in inbounds:
-    valid_ib = {}
-    for cid, col_name, col_type, notnull, dflt_value, pk in table_cols:
-        if col_name in ib:
-            valid_ib[col_name] = ib[col_name]
-        elif pk == 0 and dflt_value is None:
-            ctype = (col_type or "").upper()
-            if any(t in ctype for t in ("INT", "BOOL", "NUM", "REAL")):
-                valid_ib[col_name] = 0
-            else:
-                valid_ib[col_name] = ""
+    merged_ib = {**extra_defaults, **ib}
+    valid_ib = {k: v for k, v in merged_ib.items() if k in existing_cols}
     cols_sql = ", ".join(valid_ib.keys())
     vals_sql = ", ".join(f":{k}" for k in valid_ib.keys())
     cur.execute(f"INSERT INTO inbounds ({cols_sql}) VALUES ({vals_sql})", valid_ib)
