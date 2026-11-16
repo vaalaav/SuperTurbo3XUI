@@ -3,7 +3,7 @@ set -eu
 
 # ============================================================================
 # Интерактивный установщик 3x-ui 3.11+ + Nginx HTTP/2 XHTTP + Security Stack
-# Инбаунды: XHTTP Packet-UP ("Мобилы") + Stream-One ("Домашний") без клиентов
+# Инбаунды: XHTTP Packet-UP ("Мобилы") + Stream-One ("Домашний") + TCP Reality Self-Steal ("Reality") без клиентов
 # Маршрутизация: api->api, блокировка BitTorrent, Private IPs, Ads, Malware
 # Поддержка: Ubuntu 24.04 LTS | Маска: iqubik/myfakesite / Reverse Proxy
 # Защита: UFW + Fail2Ban + CrowdSec + C24Be AS_Network_List + CyberOK_Skipa_ips
@@ -45,7 +45,7 @@ fi
 
 clear
 echo -e "${BOLD}${CYAN}=================================================================${NC}"
-echo -e "${BOLD}   Установка 3x-ui (XHTTP Packet-UP + Stream-One) + Security      ${NC}"
+echo -e "${BOLD}   Установка 3x-ui (XHTTP + TCP Reality Self-Steal) + Security      ${NC}"
 echo -e "${BOLD}${CYAN}=================================================================${NC}\n"
 
 # 2. Интерактивный ввод параметров и предварительная проверка DNS
@@ -128,7 +128,7 @@ ADMIN_SSH_IP=$(awk '{print $1}' <<< "${SSH_CONNECTION:-}" 2>/dev/null || true)
 echo -e "\n${YELLOW}Сводка параметров перед установкой:${NC}"
 echo "  • ОС:             Ubuntu 24.04 LTS"
 echo "  • Домен:          ${DOMAIN}"
-echo "  • Инбаунды:       XHTTP Packet-UP («Мобилы») + XHTTP Stream-One («Домашний») [без клиентов]"
+echo "  • Инбаунды:       XHTTP («Мобилы» + «Домашний») + TCP Reality Self-Steal («Reality») [без клиентов]"
 echo "  • Роутинг Xray:   api->api + блокировка BitTorrent, Private IPs, Ads, Malware/Phishing"
 echo "  • Маскировка:     ${REVERSE_PROXY_URL:-Локальный сайт iqubik/myfakesite}"
 echo "  • Порт панели:    127.0.0.1:${PANEL_PORT} (путь /${PANEL_PATH}/)"
@@ -383,7 +383,7 @@ SUB_PATH="$SUB_PATH" \
 XHTTP_UP_PATH="$XHTTP_UP_PATH" \
 XHTTP_ONE_PATH="$XHTTP_ONE_PATH" \
 python3 - <<'PYEOF'
-import sqlite3, json, urllib.request, os
+import sqlite3, json, urllib.request, os, glob, subprocess, base64, secrets
 
 domain = os.environ["DOMAIN"]
 panel_port = os.environ["PANEL_PORT"]
@@ -461,6 +461,32 @@ def has_geosite_tag(dat_path, tag):
             return marker in f.read()
     except Exception:
         return False
+
+def generate_x25519_keys(bin_dir):
+    priv_key, pub_key = "", ""
+    for xbin in sorted(glob.glob(os.path.join(bin_dir, "xray*"))):
+        if os.path.isfile(xbin) and os.access(xbin, os.X_OK):
+            try:
+                out = subprocess.check_output([xbin, "x25519"], text=True, timeout=5)
+                for line in out.splitlines():
+                    if ":" not in line:
+                        continue
+                    k, v = [p.strip() for p in line.split(":", 1)]
+                    kl = k.lower()
+                    if "private" in kl:
+                        priv_key = v
+                    elif "public" in kl or "password" in kl:
+                        pub_key = v
+                if priv_key and pub_key:
+                    return priv_key, pub_key
+            except Exception:
+                pass
+    pem = subprocess.check_output(["openssl", "genpkey", "-algorithm", "X25519"])
+    der_priv = subprocess.check_output(["openssl", "pkey", "-outform", "DER"], input=pem)
+    der_pub = subprocess.check_output(["openssl", "pkey", "-pubout", "-outform", "DER"], input=pem)
+    priv_key = base64.urlsafe_b64encode(der_priv[-32:]).decode().rstrip("=")
+    pub_key = base64.urlsafe_b64encode(der_pub[-32:]).decode().rstrip("=")
+    return priv_key, pub_key
 
 base_remark = detect_server_country()
 print(f"Определено базовое имя локации: {base_remark}")
@@ -687,6 +713,72 @@ inbounds = [
     }
 ]
 
+reality_priv_key, reality_pub_key = generate_x25519_keys(bin_dir)
+reality_short_ids = [
+    secrets.token_hex(2),
+    secrets.token_hex(4),
+    secrets.token_hex(6),
+    secrets.token_hex(8)
+]
+
+inbounds.append({
+    # Inbound 3: VLESS TCP Reality Self-Steal (127.0.0.1:9443 -> 127.0.0.1:8443) -> Reality Vision (без клиентов)
+    "id": 3,
+    "user_id": 1,
+    "up": 0,
+    "down": 0,
+    "total": 0,
+    "remark": f"{base_remark} - Reality",
+    "enable": 1,
+    "expiry_time": 0,
+    "listen": "127.0.0.1",
+    "port": 9443,
+    "protocol": "vless",
+    "settings": json.dumps({
+        "clients": [],
+        "decryption": "none",
+        "fallbacks": []
+    }),
+    "stream_settings": json.dumps({
+        "network": "tcp",
+        "security": "reality",
+        "externalProxy": [{
+            "forceTls": "same",
+            "dest": domain,
+            "port": 443,
+            "remark": ""
+        }],
+        "realitySettings": {
+            "show": False,
+            "xver": 1,
+            "target": "127.0.0.1:8443",
+            "serverNames": [domain],
+            "privateKey": reality_priv_key,
+            "minClientVer": "",
+            "maxClientVer": "",
+            "maxTimediff": 0,
+            "shortIds": reality_short_ids,
+            "mldsa65Seed": "",
+            "settings": {
+                "publicKey": reality_pub_key,
+                "fingerprint": "chrome",
+                "serverName": "",
+                "spiderX": "/",
+                "mldsa65Verify": ""
+            }
+        },
+        "tcpSettings": {
+            "acceptProxyProtocol": True,
+            "header": {
+                "type": "none"
+            }
+        }
+    }),
+    "tag": "inbound-reality",
+    "sniffing": default_sniffing,
+    "allocate": default_allocate
+})
+
 table_cols = cur.execute("PRAGMA table_info(inbounds)").fetchall()
 for ib in inbounds:
     valid_ib = {}
@@ -858,10 +950,13 @@ http {
         }
     }
 
-    # Защита от сканеров по IP-адресу сервера (сброс TLS handshake)
+    port_in_redirect off;
+    set_real_ip_from 127.0.0.1;
+    real_ip_header proxy_protocol;
+
+    # Защита от сканеров по IP-адресу сервера и чужому SNI (сброс TLS handshake)
     server {
-        listen 443 ssl default_server reuseport;
-        listen [::]:443 ssl default_server reuseport;
+        listen 127.0.0.1:8443 ssl default_server proxy_protocol reuseport;
         server_name _;
 
         ssl_reject_handshake on;
@@ -872,8 +967,7 @@ http {
     }
 
     server {
-        listen 443 ssl;
-        listen [::]:443 ssl;
+        listen 127.0.0.1:8443 ssl proxy_protocol;
         http2 on;
         http2_max_concurrent_streams 1024;
         http2_chunk_size 16k;
@@ -1012,6 +1106,35 @@ ${MASK_LOCATION_BLOCK}
             root /var/www/html;
             rewrite ^ /404.html break;
         }
+    }
+}
+
+# L4 маршрутизатор на порту 443 (SNI preread -> VLESS TCP Reality Self-Steal -> Nginx HTTPS)
+stream {
+    map \$ssl_preread_server_name \$stream_backend {
+        ${DOMAIN} xray_reality;
+        default   nginx_https_reject;
+    }
+
+    upstream xray_reality {
+        server 127.0.0.1:9443 max_fails=2 fail_timeout=2s;
+        server 127.0.0.1:8443 backup;
+    }
+
+    upstream nginx_https_reject {
+        server 127.0.0.1:8443;
+    }
+
+    server {
+        listen 443 reuseport;
+        listen [::]:443 reuseport;
+        ssl_preread on;
+        preread_buffer_size 64k;
+        proxy_protocol on;
+        proxy_pass \$stream_backend;
+        proxy_connect_timeout 3s;
+        proxy_timeout 1h;
+        proxy_buffer_size 16k;
     }
 }
 EOF
@@ -1367,8 +1490,9 @@ else:
     print("  Пароль:                  [зашифрован bcrypt в БД] (сброс: /usr/local/x-ui/x-ui setting -password НОВЫЙ_ПАРОЛЬ)")
 
 print("\n  Созданные инбаунды (пользователи добавляются вручную в панели):")
-for remark, port in cur.execute("SELECT remark, port FROM inbounds WHERE enable = 1"):
-    print(f"    • {remark} (локальный порт 127.0.0.1:{port})")
+for remark, port, tag in cur.execute("SELECT remark, port, tag FROM inbounds WHERE enable = 1"):
+    extra = " [при добавлении клиента выберите Flow: xtls-rprx-vision]" if tag == "inbound-reality" else ""
+    print(f"    • {remark} (локальный порт 127.0.0.1:{port} -> внешний 443){extra}")
 
 conn.close()
 DBEOF
@@ -1566,7 +1690,7 @@ echo -e "\n${GREEN}${BOLD}======================================================
 echo -e "${GREEN}${BOLD}  УСТАНОВКА УСПЕШНО ЗАВЕРШЕНА!                                   ${NC}"
 echo -e "${GREEN}${BOLD}=================================================================${NC}"
 echo -e "  • ОС:            Ubuntu 24.04 LTS"
-echo -e "  • Инбаунды:      XHTTP Packet-UP («Мобилы») + XHTTP Stream-One («Домашний»)"
+echo -e "  • Инбаунды:      XHTTP Packet-UP («Мобилы») + XHTTP Stream-One («Домашний») + TCP Reality («Reality»)"
 echo -e "  • Пользователи:  не создавались (добавьте их в веб-панели 3x-ui)"
 echo -e "  • Роутинг Xray:  api->api + блокировка BitTorrent, Private IPs, Ads, Malware/Phishing"
 echo -e "  • UFW:           активен (открыты только SSH:${SSH_PORT}, 80, 443)"
