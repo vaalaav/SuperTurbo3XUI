@@ -5,7 +5,7 @@ set -eu
 # Интерактивный установщик 3x-ui 3.11+ + Nginx HTTP/2 XHTTP + Security Stack
 # Инбаунды: XHTTP Packet-UP ("Мобилы") + Stream-One ("Домашний") + TCP Reality Self-Steal ("Reality") без клиентов
 # Маршрутизация: api->api, блокировка BitTorrent, Private IPs, Ads, Malware
-# Поддержка: Ubuntu 24.04 LTS | Маска: iqubik/myfakesite / Reverse Proxy
+# Поддержка: Ubuntu 24.04 LTS | Маска: «Облачный диск» (mock API) / «VAPEN Cloud Storage» (S3) / Reverse Proxy
 # Защита: UFW + Fail2Ban + CrowdSec + C24Be AS_Network_List + CyberOK_Skipa_ips
 # ============================================================================
 
@@ -74,10 +74,17 @@ read -erp "2. Введите Email для Let's Encrypt [admin@${DOMAIN}]: " LE_
 LE_EMAIL=${LE_EMAIL:-"admin@${DOMAIN}"}
 
 echo -e "\n3. Режим маскировки основного домена (${DOMAIN}):"
-echo -e "   ${BOLD}[Enter]${NC} — Локальный портал-заглушка (iqubik/myfakesite, рекомендуется)"
-echo -e "   ${BOLD}[URL]${NC}   — Введите URL сайта для Reverse Proxy (например, https://example.org)"
-read -erp "   Ваш выбор [myfakesite]: " REVERSE_PROXY_URL
-REVERSE_PROXY_URL=$(echo "$REVERSE_PROXY_URL" | tr -d '[:space:]')
+printf "   ${BOLD}%-13s${NC} — %s\n" "[Enter] / 1" "«Облачный диск»: mock API и форма входа (рекомендуется)"
+printf "   ${BOLD}%-13s${NC} — %s\n" "2 / vapen"   "«VAPEN Cloud Storage»: S3-эмуляция (/s3, /api/v1/health)"
+printf "   ${BOLD}%-13s${NC} — %s\n" "[URL]"       "Reverse Proxy на другой сайт (например, https://example.org)"
+read -erp "   Ваш выбор [1]: " MASK_INPUT
+MASK_INPUT=$(echo "$MASK_INPUT" | tr -d '[:space:]')
+REVERSE_PROXY_URL=""
+case "${MASK_INPUT,,}" in
+    ""|1|disk)  MASK_MODE="disk";  MASK_LABEL="Локальный сайт «Облачный диск»" ;;
+    2|vapen)    MASK_MODE="vapen"; MASK_LABEL="Локальный портал «VAPEN Cloud Storage»" ;;
+    *)          MASK_MODE="proxy"; REVERSE_PROXY_URL="$MASK_INPUT"; MASK_LABEL="Reverse Proxy → ${MASK_INPUT}" ;;
+esac
 
 # Генерация сложных случайных логина (12 симв.) и пароля (20 симв. со спецсимволами)
 RAND_USER=$(python3 -c 'import secrets, string; alphabet = string.ascii_letters + string.digits; print("".join(secrets.choice(alphabet) for _ in range(12)))')
@@ -130,7 +137,7 @@ echo "  • ОС:             Ubuntu 24.04 LTS"
 echo "  • Домен:          ${DOMAIN}"
 echo "  • Инбаунды:       XHTTP («Мобилы» + «Домашний») + TCP Reality Self-Steal («Reality») [без клиентов]"
 echo "  • Роутинг Xray:   api->api + блокировка BitTorrent, Private IPs, Ads, Malware/Phishing"
-echo "  • Маскировка:     ${REVERSE_PROXY_URL:-Локальный сайт iqubik/myfakesite}"
+echo "  • Маскировка:     ${MASK_LABEL}"
 echo "  • Порт панели:    127.0.0.1:${PANEL_PORT} (путь /${PANEL_PATH}/)"
 echo "  • Порт подписки:  127.0.0.1:${SUB_PORT} (путь /${SUB_PATH}/)"
 echo "  • Логин панели:   ${PANEL_USER}"
@@ -254,56 +261,249 @@ systemctl restart x-ui
 EOF
 chmod +x /etc/letsencrypt/renewal-hooks/deploy/reload-services.sh
 
-# 7. Подготовка сайта-заглушки (адаптированный iqubik/myfakesite или Reverse Proxy)
+# 7. Подготовка сайта-заглушки («Облачный диск», «VAPEN Cloud Storage» или Reverse Proxy)
 log_info "Настройка маскировочного сайта..."
 mkdir -p /var/cache/nginx/img_cache /var/cache/nginx/html_cache /var/www/myfakesite /var/www/html /var/log/nginx
 touch /var/log/nginx/access.log /var/log/nginx/error.log
 
-if [[ -z "$REVERSE_PROXY_URL" ]]; then
-    log_info "Загрузка фронтенда iqubik/myfakesite (без Docker/PHP)..."
-    BASE_RAW="https://raw.githubusercontent.com/iqubik/myfakesite/main/data"
-    if ! curl -fsSL "${BASE_RAW}/index.html" -o /var/www/myfakesite/index.html; then
-        log_warn "Репозиторий iqubik/myfakesite недоступен, создаём локальную стартовую страницу..."
-        cat <<'FALLBACK_EOF' > /var/www/myfakesite/index.html
+if [[ "$MASK_MODE" == "disk" ]]; then
+    log_info "Установка локального сайта-заглушки «Облачный диск» (mock API, без Docker/PHP)..."
+    cat <<'FS_HTML_EOF' > /var/www/myfakesite/index.html
 <!DOCTYPE html>
-<html lang="en">
+<html lang="ru">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>YOUDOMEN.XXX — Cloud Edge Node</title>
-<style>
-body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#0f172a;color:#e2e8f0;display:flex;align-items:center;justify-content:center;min-height:100vh}
-.card{background:#1e293b;padding:2.5rem;border-radius:1rem;box-shadow:0 20px 25px -5px rgba(0,0,0,.5);max-width:460px;width:90%;text-align:center;border:1px solid #334155}
-h1{font-size:1.4rem;margin:0 0 .75rem;color:#38bdf8}
-p{color:#94a3b8;font-size:.95rem;line-height:1.5;margin:0 0 1.25rem}
-.badge{display:inline-block;padding:.35rem .85rem;border-radius:9999px;background:rgba(34,197,94,.15);color:#4ade80;font-size:.8rem;font-weight:600}
-</style>
+<meta name="robots" content="noindex, nofollow">
+<title>Облачный диск — вход</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Cpath fill='%230f7b6c' d='M18 48a12 12 0 0 1-1-24 16 16 0 0 1 30 4 10 10 0 0 1 0 20z'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="/style.css">
 </head>
 <body>
-<div class="card">
-<h1>YOUDOMEN.XXX</h1>
-<p>Static Content Delivery &amp; Edge Routing Node.<br>All edge services are operating normally.</p>
-<span class="badge">● System Operational</span>
-</div>
+<main>
+  <div class="wrap">
+    <section class="intro" aria-label="О сервисе">
+      <div class="brand">
+        <svg viewBox="0 0 64 64" aria-hidden="true"><path fill="var(--accent)" d="M18 50a13 13 0 0 1-1.5-25.9A17 17 0 0 1 49 27a11 11 0 0 1-1 23z"/><path fill="var(--surface)" d="M32 28l-8 9h5v8h6v-8h5z"/></svg>
+        <span>Облачный диск</span>
+      </div>
+      <h1>Ваши файлы всегда под рукой</h1>
+      <p>Храните документы, фото и архивы в одном месте и делитесь ссылками с коллегами. Доступ только по приглашению.</p>
+      <div class="files" aria-hidden="true">
+        <div class="row"><i></i><b>Проекты</b><span>12 файлов</span></div>
+        <div class="row"><i></i><b>Бухгалтерия</b><span class="lock">закрыто</span></div>
+        <div class="row"><i class="f"></i><b>Договор_2026.pdf</b><span>2,4 МБ</span></div>
+        <div class="row"><i class="f"></i><b>Резервная_копия.zip</b><span>148 МБ</span></div>
+      </div>
+    </section>
+
+    <section class="panel" aria-labelledby="t">
+      <h2 id="t">Вход в аккаунт</h2>
+      <p class="sub">Введите данные, которые вам выдал администратор.</p>
+      <form id="f" autocomplete="on" novalidate>
+        <div class="field">
+          <label for="u">Логин или email</label>
+          <input id="u" name="username" type="text" autocomplete="username" autocapitalize="off" spellcheck="false" required>
+        </div>
+        <div class="field">
+          <label for="p">Пароль</label>
+          <div class="pw">
+            <input id="p" name="password" type="password" autocomplete="current-password" required>
+            <button type="button" id="show" aria-pressed="false">Показать</button>
+          </div>
+        </div>
+        <div class="opts">
+          <label><input type="checkbox" name="remember"> Запомнить меня</label>
+          <a href="#" id="forgot">Забыли пароль?</a>
+        </div>
+        <button class="btn" id="go" type="submit">Войти</button>
+        <p class="msg" id="msg" role="alert" aria-live="polite"></p>
+      </form>
+      <p class="alt">Нет аккаунта? Регистрация закрыта. Обратитесь к администратору вашего пространства.</p>
+    </section>
+  </div>
+</main>
+<footer>
+  <a href="#" data-note="Политика конфиденциальности недоступна без входа.">Конфиденциальность</a>
+  <a href="#" data-note="Условия использования доступны после входа в аккаунт.">Условия</a>
+  <a href="#" data-note="Справка доступна после входа в аккаунт.">Помощь</a>
+  <div class="ver"><span class="dot" id="dot"></span><span id="ver">Проверка сервиса…</span></div>
+</footer>
+
+<script src="/app.js" defer></script>
 </body>
 </html>
-FALLBACK_EOF
-    fi
-    curl -fsSL "${BASE_RAW}/favicon.ico" -o /var/www/myfakesite/favicon.ico 2>/dev/null || true
-    curl -fsSL "${BASE_RAW}/apple-touch-icon.png" -o /var/www/myfakesite/apple-touch-icon.png 2>/dev/null || true
-    cp /var/www/myfakesite/favicon.ico /var/www/html/favicon.ico 2>/dev/null || true
+FS_HTML_EOF
+    cat <<'FS_CSS_EOF' > /var/www/myfakesite/style.css
+:root{
+  --bg:#eef1ee; --surface:#ffffff; --ink:#18262b; --muted:#5d6b70; --line:#d5dcd8;
+  --accent:#0f7b6c; --accent-ink:#ffffff; --danger:#b3261e; --field:#f7f9f7;
+  --shadow:0 1px 2px rgba(24,38,43,.06),0 12px 32px rgba(24,38,43,.08);
+}
+:root:not([data-theme="light"]){}
+@media (prefers-color-scheme:dark){
+  :root:not([data-theme="light"]){
+    --bg:#0f1a1c; --surface:#16252a; --ink:#e6eeec; --muted:#93a5a8; --line:#264047;
+    --accent:#2fb59f; --accent-ink:#06201c; --danger:#ff8a80; --field:#102024;
+    --shadow:0 1px 2px rgba(0,0,0,.3),0 12px 32px rgba(0,0,0,.35);
+  }
+}
+:root[data-theme="dark"]{
+  --bg:#0f1a1c; --surface:#16252a; --ink:#e6eeec; --muted:#93a5a8; --line:#264047;
+  --accent:#2fb59f; --accent-ink:#06201c; --danger:#ff8a80; --field:#102024;
+  --shadow:0 1px 2px rgba(0,0,0,.3),0 12px 32px rgba(0,0,0,.35);
+}
+*{box-sizing:border-box}
+html,body{height:100%}
+body{
+  margin:0; background:var(--bg); color:var(--ink);
+  font:16px/1.5 "Segoe UI",system-ui,-apple-system,"Helvetica Neue",Roboto,Arial,sans-serif;
+  display:flex; flex-direction:column; min-height:100vh;
+  background-image:
+    radial-gradient(60rem 30rem at 85% -10%,color-mix(in srgb,var(--accent) 14%,transparent),transparent 70%),
+    radial-gradient(40rem 24rem at -10% 110%,color-mix(in srgb,var(--accent) 10%,transparent),transparent 70%);
+}
+main{flex:1; display:grid; place-items:center; padding:32px 20px}
+.wrap{width:100%; max-width:880px; display:grid; grid-template-columns:1.05fr 1fr; background:var(--surface); border:1px solid var(--line); border-radius:14px; box-shadow:var(--shadow); overflow:hidden}
+.intro{padding:40px 36px; border-right:1px solid var(--line); display:flex; flex-direction:column; gap:28px; background:var(--field)}
+.brand{display:flex; align-items:center; gap:12px; font-weight:650; font-size:1.2rem; letter-spacing:.1px}
+.brand svg{width:34px; height:34px; flex:none}
+.intro h1{font-size:1.55rem; line-height:1.25; margin:0; font-weight:650; max-width:18ch}
+.intro p{margin:0; color:var(--muted); max-width:38ch}
+.files{margin-top:auto; border:1px solid var(--line); border-radius:10px; background:var(--surface); padding:6px 0; font-size:.9rem}
+.row{display:flex; align-items:center; gap:10px; padding:8px 14px; color:var(--muted)}
+.row b{color:var(--ink); font-weight:500; flex:1; white-space:nowrap; overflow:hidden; text-overflow:ellipsis}
+.row i{width:16px; height:12px; border-radius:2px; background:color-mix(in srgb,var(--accent) 55%,var(--surface)); flex:none}
+.row i.f{height:16px; width:12px; background:var(--line)}
+.row .lock{font-size:.78rem}
+.panel{padding:40px 36px; display:flex; flex-direction:column; justify-content:center}
+.panel h2{margin:0 0 4px; font-size:1.3rem; font-weight:650}
+.panel .sub{margin:0 0 24px; color:var(--muted); font-size:.95rem}
+label{display:block; font-size:.88rem; font-weight:600; margin:0 0 6px}
+.field{margin-bottom:16px}
+input[type=text],input[type=password]{
+  width:100%; padding:11px 12px; font:inherit; color:var(--ink); background:var(--field);
+  border:1px solid var(--line); border-radius:8px; transition:border-color .15s, box-shadow .15s;
+}
+input:focus{outline:none; border-color:var(--accent); box-shadow:0 0 0 3px color-mix(in srgb,var(--accent) 25%,transparent)}
+.pw{position:relative}
+.pw button{position:absolute; right:6px; top:50%; transform:translateY(-50%); background:none; border:0; color:var(--muted); font:inherit; font-size:.82rem; padding:6px 8px; cursor:pointer; border-radius:6px}
+.pw button:hover{color:var(--ink)}
+.opts{display:flex; justify-content:space-between; align-items:center; margin:2px 0 20px; font-size:.9rem}
+.opts label{display:flex; align-items:center; gap:8px; font-weight:400; margin:0; cursor:pointer}
+.opts input{accent-color:var(--accent); width:16px; height:16px; margin:0}
+a{color:var(--accent); text-decoration:none}
+a:hover{text-decoration:underline}
+:where(a,button,input):focus-visible{outline:2px solid var(--accent); outline-offset:2px}
+.btn{width:100%; padding:12px 16px; font:inherit; font-weight:600; border:0; border-radius:8px; background:var(--accent); color:var(--accent-ink); cursor:pointer; transition:filter .15s}
+.btn:hover{filter:brightness(1.08)}
+.btn[disabled]{opacity:.7; cursor:progress}
+.msg{min-height:1.4em; margin:14px 0 0; font-size:.9rem; color:var(--danger)}
+.msg.info{color:var(--muted)}
+.alt{margin-top:22px; padding-top:18px; border-top:1px solid var(--line); font-size:.9rem; color:var(--muted)}
+footer{padding:18px 20px 26px; text-align:center; font-size:.82rem; color:var(--muted)}
+footer a{color:var(--muted); margin:0 8px}
+@media (max-width:760px){
+  .wrap{grid-template-columns:1fr}
+  .intro{border-right:0; border-bottom:1px solid var(--line); padding:28px 24px; gap:18px}
+  .files{display:none}
+  .panel{padding:28px 24px}
+}
+@media (prefers-reduced-motion:reduce){*{transition:none!important}}
+.ver{margin-top:8px;display:flex;justify-content:center;align-items:center;gap:6px}
+.dot{width:8px;height:8px;border-radius:50%;background:var(--line)}
+.dot.ok{background:var(--accent)}
+.dot.err{background:var(--danger)}
+FS_CSS_EOF
+    cat <<'FS_JS_EOF' > /var/www/myfakesite/app.js
+(function () {
+  var f = document.getElementById('f'), u = document.getElementById('u'), p = document.getElementById('p'),
+      msg = document.getElementById('msg'), go = document.getElementById('go'), show = document.getElementById('show'),
+      ver = document.getElementById('ver'), dot = document.getElementById('dot'),
+      remember = f.querySelector('[name=remember]');
 
-    sed -i "s/YOUDOMEN\.XXX/${DOMAIN}/g" /var/www/myfakesite/index.html
+  function say(t, info) { msg.textContent = t; msg.className = 'msg' + (info ? ' info' : ''); }
+
+  show.addEventListener('click', function () {
+    var hidden = p.type === 'password';
+    p.type = hidden ? 'text' : 'password';
+    show.textContent = hidden ? 'Скрыть' : 'Показать';
+    show.setAttribute('aria-pressed', String(hidden));
+  });
+
+  // Проверка доступности сервиса: GET /api/status
+  fetch('/api/status', { cache: 'no-store' })
+    .then(function (r) { if (!r.ok) throw 0; return r.json(); })
+    .then(function (d) { ver.textContent = 'Версия ' + d.version + ' · сервис доступен'; dot.className = 'dot ok'; })
+    .catch(function () { ver.textContent = 'Сервис недоступен'; dot.className = 'dot err'; });
+
+  // Вход: POST /api/auth (401 — неверные данные, 429 — слишком много попыток)
+  f.addEventListener('submit', function (e) {
+    e.preventDefault();
+    if (!u.value.trim() || !p.value) { say('Введите логин и пароль.'); (u.value.trim() ? p : u).focus(); return; }
+    go.disabled = true; go.textContent = 'Проверяем…'; say('');
+    fetch('/api/auth', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'same-origin',
+      body: JSON.stringify({ username: u.value.trim(), password: p.value, remember: !!(remember && remember.checked) })
+    }).then(function (r) {
+      if (r.status === 429) say('Слишком много попыток входа. Повторите через минуту.');
+      else if (r.status === 401) say('Неверный логин или пароль. Проверьте данные и попробуйте снова.');
+      else say('Сервис временно недоступен. Повторите попытку позже.');
+    }).catch(function () {
+      say('Нет соединения с сервером. Проверьте интернет и повторите попытку.');
+    }).then(function () {
+      go.disabled = false; go.textContent = 'Войти'; p.value = ''; p.focus();
+    });
+  });
+
+  document.getElementById('forgot').addEventListener('click', function (e) {
+    e.preventDefault(); say('Восстановление пароля выполняет администратор вашего пространства.', true);
+  });
+  Array.prototype.forEach.call(document.querySelectorAll('[data-note]'), function (a) {
+    a.addEventListener('click', function (e) { e.preventDefault(); say(a.getAttribute('data-note'), true); });
+  });
+})();
+FS_JS_EOF
 
     MASK_LOCATION_BLOCK=$(cat <<'EOF'
-        # Адаптированный Mock API из iqubik/myfakesite
+        # Mock API «облачного диска» (ответы отдаёт сам nginx)
         location = /api/status {
             default_type application/json;
-            return 200 '{"status":"operational","version":"2.4.1","region":"eu-central"}';
+            expires -1;
+            return 200 '{"ok":true,"service":"storage","version":"3.2.1"}';
         }
+        location = /api/files {
+            default_type application/json;
+            return 401 '{"ok":false,"error":"unauthorized"}';
+        }
+        location = /api/settings {
+            default_type application/json;
+            return 401 '{"ok":false,"error":"unauthorized"}';
+        }
+        # Вход: limit_req срабатывает раньше try_files, поэтому 401 отдаёт именованный location
+        # (return прямо в location выполняется до limit_req и лимит бы не работал)
         location = /api/auth {
             default_type application/json;
-            return 401 '{"error":"invalid_credentials","message":"Authentication required"}';
+            root /var/www/myfakesite;
+            if ($request_method != POST) { return 405 '{"ok":false,"error":"method_not_allowed"}'; }
+            limit_req zone=fs_auth burst=3 nodelay;
+            error_page 429 = @fs_too_many;
+            try_files /__none @fs_auth_fail;
+        }
+        location @fs_auth_fail {
+            default_type application/json;
+            return 401 '{"ok":false,"error":"invalid_credentials"}';
+        }
+        location @fs_too_many {
+            default_type application/json;
+            add_header Retry-After 60 always;
+            return 429 '{"ok":false,"error":"too_many_requests"}';
+        }
+        location ^~ /api/ {
+            default_type application/json;
+            return 404 '{"ok":false,"error":"not_found"}';
         }
         location / {
             limit_req zone=bot burst=20 nodelay;
@@ -311,6 +511,495 @@ FALLBACK_EOF
             root /var/www/myfakesite;
             index index.html;
             try_files $uri $uri/ /index.html;
+        }
+EOF
+)
+elif [[ "$MASK_MODE" == "vapen" ]]; then
+    log_info "Установка локального портала «VAPEN Cloud Storage» (S3-эмуляция, без Docker/PHP)..."
+    cat <<'FS_VAPEN_INDEX_EOF' > /var/www/myfakesite/index.html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="VAPEN Cloud Storage — Enterprise S3-Compatible Object Storage, Distributed NVMe Clusters, and Global Edge Content Delivery.">
+  <meta name="keywords" content="VAPEN Cloud Storage, S3 Object Storage, NVMe Cloud, Distributed Storage, Zero-Knowledge Encryption, Edge CDN">
+  <meta name="robots" content="noindex, nofollow">
+  <meta property="og:title" content="VAPEN Cloud Storage | Enterprise Object Storage & Edge Network">
+  <meta property="og:description" content="High-throughput S3-compatible NVMe object storage with immutable backups and global Anycast replication.">
+  <meta property="og:type" content="website">
+  <title>VAPEN Cloud Storage | Enterprise NVMe Object Storage & Edge Telemetry</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>☁️</text></svg>">
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "Organization",
+    "name": "VAPEN Cloud Storage",
+    "description": "Enterprise S3 Object Storage and Distributed Edge Infrastructure",
+    "url": "https://vapen-storage.internal"
+  }
+  </script>
+  <style>
+    :root {
+      --bg-main: #060911;
+      --bg-card: #0f1626;
+      --bg-card-hover: #151f36;
+      --border: #1e293b;
+      --text-main: #f8fafc;
+      --text-muted: #94a3b8;
+      --accent: #3b82f6;
+      --accent-glow: rgba(59, 130, 246, 0.25);
+      --success: #10b981;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background-color: var(--bg-main);
+      color: var(--text-main);
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      line-height: 1.6;
+    }
+    header {
+      border-bottom: 1px solid var(--border);
+      background: rgba(6, 9, 17, 0.85);
+      backdrop-filter: blur(10px);
+      position: sticky;
+      top: 0;
+      z-index: 100;
+    }
+    .container { max-width: 1200px; margin: 0 auto; padding: 0 1.5rem; }
+    .nav-bar { display: flex; justify-content: space-between; align-items: center; height: 70px; }
+    .logo { font-weight: 700; font-size: 1.25rem; display: flex; align-items: center; gap: 10px; color: var(--text-main); text-decoration: none; letter-spacing: 0.02em; }
+    .logo-badge { background: var(--accent); color: #fff; font-size: 0.7rem; padding: 2px 7px; border-radius: 4px; text-transform: uppercase; }
+    nav ul { display: flex; list-style: none; gap: 2rem; }
+    nav a { color: var(--text-muted); text-decoration: none; font-size: 0.95rem; transition: color 0.2s; }
+    nav a:hover { color: var(--text-main); }
+    .nav-actions { display: flex; align-items: center; gap: 1rem; }
+    .btn { padding: 0.5rem 1.1rem; border-radius: 6px; font-size: 0.9rem; font-weight: 500; cursor: pointer; border: 1px solid transparent; transition: all 0.2s; text-decoration: none; }
+    .btn-outline { border-color: var(--border); background: transparent; color: var(--text-main); }
+    .btn-outline:hover { background: var(--bg-card); }
+    .btn-primary { background: var(--accent); color: #fff; box-shadow: 0 0 15px var(--accent-glow); }
+    .btn-primary:hover { background: #2563eb; }
+    .hero { padding: 4.5rem 0 3rem; border-bottom: 1px solid var(--border); background: radial-gradient(circle at 50% 0%, #111d38 0%, var(--bg-main) 70%); }
+    .hero-grid { display: grid; grid-template-columns: 1.2fr 0.8fr; gap: 3rem; align-items: center; }
+    .status-pill { display: inline-flex; align-items: center; gap: 10px; background: rgba(16, 185, 129, 0.1); border: 1px solid rgba(16, 185, 129, 0.3); padding: 6px 14px; border-radius: 999px; font-size: 0.85rem; color: #34d399; margin-bottom: 1.5rem; }
+    .dot { width: 9px; height: 9px; background-color: var(--success); border-radius: 50%; display: inline-block; animation: pulse 2s infinite; }
+    @keyframes pulse {
+      0% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.7); }
+      70% { transform: scale(1); box-shadow: 0 0 0 8px rgba(16, 185, 129, 0); }
+      100% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(16, 185, 129, 0); }
+    }
+    h1 { font-size: 2.75rem; line-height: 1.2; margin-bottom: 1.25rem; letter-spacing: -0.02em; }
+    .hero p { color: var(--text-muted); font-size: 1.1rem; margin-bottom: 2rem; max-width: 580px; }
+    .telemetry-card { background: var(--bg-card); border: 1px solid var(--border); border-radius: 12px; padding: 1.5rem; box-shadow: 0 20px 40px rgba(0,0,0,0.4); }
+    .telemetry-header { display: flex; justify-content: space-between; align-items: center; padding-bottom: 1rem; border-bottom: 1px solid var(--border); margin-bottom: 1rem; font-size: 0.9rem; }
+    .metric-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 1rem; margin-bottom: 1rem; }
+    .metric-box { background: rgba(255,255,255,0.02); border: 1px solid var(--border); padding: 0.85rem; border-radius: 8px; }
+    .metric-label { font-size: 0.75rem; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.05em; }
+    .metric-val { font-size: 1.35rem; font-weight: 700; font-family: monospace; color: var(--text-main); margin-top: 4px; }
+    .clock-bar { font-family: monospace; font-size: 0.82rem; color: var(--text-muted); display: flex; justify-content: space-between; padding-top: 0.75rem; border-top: 1px solid var(--border); }
+    .section { padding: 4rem 0; border-bottom: 1px solid var(--border); }
+    .section-title { font-size: 1.75rem; margin-bottom: 0.5rem; }
+    .section-sub { color: var(--text-muted); margin-bottom: 2rem; }
+    .table-wrap { background: var(--bg-card); border: 1px solid var(--border); border-radius: 12px; overflow: hidden; }
+    table { width: 100%; border-collapse: collapse; text-align: left; font-size: 0.92rem; }
+    th, td { padding: 1rem 1.25rem; border-bottom: 1px solid var(--border); }
+    th { background: rgba(255,255,255,0.02); color: var(--text-muted); font-weight: 600; font-size: 0.8rem; text-transform: uppercase; }
+    tr:last-child td { border-bottom: none; }
+    .badge-ok { background: rgba(16, 185, 129, 0.15); color: #34d399; padding: 3px 8px; border-radius: 4px; font-size: 0.78rem; font-family: monospace; }
+    .grid-3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1.5rem; }
+    .card { background: var(--bg-card); border: 1px solid var(--border); border-radius: 10px; padding: 1.5rem; transition: background 0.2s; }
+    .card:hover { background: var(--bg-card-hover); }
+    .card h3 { font-size: 1.15rem; margin-bottom: 0.6rem; }
+    .card p { color: var(--text-muted); font-size: 0.9rem; }
+    .calc-box { background: var(--bg-card); border: 1px solid var(--border); border-radius: 12px; padding: 2rem; margin-top: 2rem; display: flex; justify-content: space-between; align-items: center; gap: 2rem; }
+    input[type="range"] { width: 100%; accent-color: var(--accent); margin-top: 0.75rem; }
+    .modal-backdrop { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.75); z-index: 200; align-items: center; justify-content: center; }
+    .modal { background: var(--bg-card); border: 1px solid var(--border); border-radius: 12px; width: 100%; max-width: 400px; padding: 2rem; }
+    .modal input { width: 100%; padding: 0.65rem; margin: 0.5rem 0 1rem; background: var(--bg-main); border: 1px solid var(--border); color: #fff; border-radius: 6px; }
+    footer { padding: 3rem 0; color: var(--text-muted); font-size: 0.85rem; }
+    .footer-grid { display: grid; grid-template-columns: 2fr 1fr 1fr 1fr; gap: 2rem; margin-bottom: 2rem; }
+    .footer-col h4 { color: var(--text-main); margin-bottom: 0.75rem; font-size: 0.95rem; }
+    .footer-col ul { list-style: none; }
+    .footer-col li { margin-bottom: 0.4rem; }
+    .footer-col a { color: var(--text-muted); text-decoration: none; }
+    @media (max-width: 768px) {
+      .hero-grid, .grid-3, .footer-grid, .calc-box { grid-template-columns: 1fr; flex-direction: column; }
+      nav ul { display: none; }
+    }
+  </style>
+</head>
+<body>
+<header>
+  <div class="container nav-bar">
+    <a href="#" class="logo">☁️ VAPEN Cloud Storage <span class="logo-badge">S3 Edge v4.2</span></a>
+    <nav>
+      <ul>
+        <li><a href="#network">Storage Clusters</a></li>
+        <li><a href="#products">Architecture</a></li>
+        <li><a href="#calculator">Volume Pricing</a></li>
+        <li><a href="/api/v1/health" target="_blank">API Health</a></li>
+        <li><a href="#docs" onclick="openModal(); return false;">S3 API Docs</a></li>
+      </ul>
+    </nav>
+    <div class="nav-actions">
+      <button class="btn btn-outline" onclick="openModal()">Tenant SSO</button>
+      <button class="btn btn-primary" onclick="openModal()">Storage Console</button>
+    </div>
+  </div>
+</header>
+<section class="hero">
+  <div class="container hero-grid">
+    <div>
+      <div class="status-pill">
+        <span class="dot"></span>
+        <span>All NVMe Object Clusters Operational • TLS 1.3 Enforced</span>
+      </div>
+      <h1>High-Throughput S3 Object Storage & Edge Fabric</h1>
+      <p>Deploy immutable enterprise backups, zero-egress distributed buckets, and low-latency edge caching with 99.999999999% (11 9s) data durability across global availability zones.</p>
+      <div style="display: flex; gap: 1rem;">
+        <a href="#network" class="btn btn-primary">Cluster Telemetry</a>
+        <a href="#calculator" class="btn btn-outline">Estimate Storage Cost</a>
+      </div>
+    </div>
+    <div class="telemetry-card">
+      <div class="telemetry-header">
+        <strong>⚡ Local Storage Node Telemetry</strong>
+        <span class="badge-ok">S3 / HTTP3 QUIC</span>
+      </div>
+      <div class="metric-grid">
+        <div class="metric-box">
+          <div class="metric-label">Cluster Egress</div>
+          <div class="metric-val" id="m-bw">44.2 Gbps</div>
+        </div>
+        <div class="metric-box">
+          <div class="metric-label">S3 PUT/GET IOPS</div>
+          <div class="metric-val" id="m-req">24,810 ops</div>
+        </div>
+        <div class="metric-box">
+          <div class="metric-label">NVMe Pool Load</div>
+          <div class="metric-val" id="m-cpu">16.4%</div>
+        </div>
+        <div class="metric-box">
+          <div class="metric-label">Time to First Byte</div>
+          <div class="metric-val" id="m-ping">1.9 ms</div>
+        </div>
+      </div>
+      <div class="clock-bar">
+        <span id="clock">Syncing NTP...</span>
+        <span id="ray-id">NodeID: initializing...</span>
+      </div>
+    </div>
+  </div>
+</section>
+<section id="network" class="section">
+  <div class="container">
+    <h2 class="section-title">Multi-Region Replication Status</h2>
+    <p class="section-sub">Real-time erasure coding health and backbone synchronization across primary Tier-4 VAPEN storage vaults.</p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Vault ID</th>
+            <th>Availability Zone</th>
+            <th>Replication Mode</th>
+            <th>NVMe Latency</th>
+            <th>Cluster State</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>VLT-FRA-01</strong></td>
+            <td>Frankfurt, DE (EU-Central)</td>
+            <td>S3 Multi-AZ / AES-256-GCM</td>
+            <td>1.8 ms</td>
+            <td><span class="badge-ok">200 OK • Synced</span></td>
+          </tr>
+          <tr>
+            <td><strong>VLT-AMS-04</strong></td>
+            <td>Amsterdam, NL (EU-West)</td>
+            <td>S3 Multi-AZ / AES-256-GCM</td>
+            <td>2.9 ms</td>
+            <td><span class="badge-ok">200 OK • Synced</span></td>
+          </tr>
+          <tr>
+            <td><strong>VLT-HEL-02</strong></td>
+            <td>Helsinki, FI (Nordic-Core)</td>
+            <td>S3 Multi-AZ / AES-256-GCM</td>
+            <td>4.6 ms</td>
+            <td><span class="badge-ok">200 OK • Synced</span></td>
+          </tr>
+          <tr>
+            <td><strong>VLT-IAD-09</strong></td>
+            <td>Ashburn, US (US-East)</td>
+            <td>S3 Cross-Region / Async</td>
+            <td>17.4 ms</td>
+            <td><span class="badge-ok">200 OK • Synced</span></td>
+          </tr>
+          <tr>
+            <td><strong>VLT-SIN-03</strong></td>
+            <td>Singapore (APAC-Hub)</td>
+            <td>S3 Cross-Region / Async</td>
+            <td>29.8 ms</td>
+            <td><span class="badge-ok">200 OK • Synced</span></td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</section>
+<section id="products" class="section">
+  <div class="container">
+    <h2 class="section-title">VAPEN Enterprise Storage Stack</h2>
+    <p class="section-sub">Engineered for AI dataset training, Kubernetes persistent volumes, and immutable archival.</p>
+    <div class="grid-3">
+      <div class="card">
+        <h3>🗄️ 100% S3-Compatible API</h3>
+        <p>Drop-in replacement for AWS S3. Native support for Terraform, rclone, Veeam, and Kubernetes CSI drivers with zero code changes.</p>
+      </div>
+      <div class="card">
+        <h3>⚡ All-NVMe Erasure Coding</h3>
+        <p>Distributed Reed-Solomon parity across independent fault domains guarantees instant recovery without degraded read performance.</p>
+      </div>
+      <div class="card">
+        <h3>🔒 Object Lock & Zero-Trust</h3>
+        <p>WORM (Write-Once-Read-Many) ransomware protection, client-side KMS encryption keys, and hardware mTLS bucket policies.</p>
+      </div>
+    </div>
+    <div id="calculator" class="calc-box">
+      <div style="flex: 1;">
+        <h3>Enterprise Storage Volume Estimator</h3>
+        <p style="color: var(--text-muted); font-size: 0.9rem;">Slide to calculate monthly flat-rate provisioning for dedicated NVMe object storage (zero egress fees).</p>
+        <input type="range" id="bw-slider" min="10" max="1000" step="10" value="150" oninput="updateCalc(this.value)">
+      </div>
+      <div style="text-align: right; min-width: 240px;">
+        <div class="metric-label">Reserved Capacity</div>
+        <div class="metric-val" id="calc-out" style="color: var(--accent);">150 TB / $1,050 mo</div>
+      </div>
+    </div>
+  </div>
+</section>
+<footer>
+  <div class="container">
+    <div class="footer-grid">
+      <div class="footer-col">
+        <h4>☁️ VAPEN Cloud Storage</h4>
+        <p>Enterprise distributed NVMe object storage, S3 edge caching, and encrypted archival infrastructure. ISO/IEC 27001 & SOC2 Type II Certified.</p>
+      </div>
+      <div class="footer-col">
+        <h4>Infrastructure</h4>
+        <ul>
+          <li><a href="#network">S3 Object Storage</a></li>
+          <li><a href="#products">NVMe Block Volumes</a></li>
+          <li><a href="/api/v1/health" target="_blank">Node Health API</a></li>
+        </ul>
+      </div>
+      <div class="footer-col">
+        <h4>Compliance</h4>
+        <ul>
+          <li><a href="#" onclick="openModal(); return false;">GDPR Data Processing</a></li>
+          <li><a href="#" onclick="openModal(); return false;">99.999% SLA Policy</a></li>
+          <li><a href="#" onclick="openModal(); return false;">Security Whitepaper</a></li>
+        </ul>
+      </div>
+      <div class="footer-col">
+        <h4>Network</h4>
+        <ul>
+          <li>NOC: 24/7/365 Active</li>
+          <li>AS-Number: AS398102</li>
+          <li>S3 Endpoint: Active</li>
+        </ul>
+      </div>
+    </div>
+    <div style="border-top: 1px solid var(--border); padding-top: 1.5rem; display: flex; justify-content: space-between;">
+      <span>© 2026 VAPEN Cloud Storage. All rights reserved.</span>
+      <span>TLS 1.3 End-to-End Encrypted Session</span>
+    </div>
+  </div>
+</footer>
+<div class="modal-backdrop" id="auth-modal">
+  <div class="modal">
+    <h3 style="margin-bottom: 0.5rem;">VAPEN Storage Console</h3>
+    <p style="color: var(--text-muted); font-size: 0.85rem; margin-bottom: 1rem;">Sign in with your Tenant Access Key or Corporate SAML 2.0 SSO.</p>
+    <form onsubmit="handleAuth(event)">
+      <label style="font-size: 0.8rem; color: var(--text-muted);">Tenant ID / Corporate Email</label>
+      <input type="email" required placeholder="admin@tenant-storage.io">
+      <label style="font-size: 0.8rem; color: var(--text-muted);">Secret Access Key / YubiKey OTP</label>
+      <input type="password" required placeholder="••••••••••••••••">
+      <p id="auth-err" style="color: #f87171; font-size: 0.8rem; display: none; margin-bottom: 0.75rem;">Error 403 (AccessDenied): Client IP is not authorized in this bucket's VPC policy.</p>
+      <div style="display: flex; justify-content: flex-end; gap: 0.5rem;">
+        <button type="button" class="btn btn-outline" onclick="closeModal()">Cancel</button>
+        <button type="submit" class="btn btn-primary">Authenticate</button>
+      </div>
+    </form>
+  </div>
+</div>
+<script>
+  const rayHex = Array.from({length: 16}, () => Math.floor(Math.random()*16).toString(16)).join('');
+  document.getElementById('ray-id').textContent = 'ReqID: ' + rayHex.toUpperCase();
+  function updateClock() {
+    const now = new Date();
+    document.getElementById('clock').textContent = now.toISOString().replace('T', ' ').substring(0, 19) + ' UTC';
+  }
+  setInterval(updateClock, 1000);
+  updateClock();
+  setInterval(() => {
+    const bw = (42 + Math.random() * 4.5).toFixed(1);
+    const req = Math.floor(24100 + Math.random() * 1800).toLocaleString();
+    const cpu = (14 + Math.random() * 5).toFixed(1);
+    const ping = (1.7 + Math.random() * 0.4).toFixed(1);
+    document.getElementById('m-bw').textContent = bw + ' Gbps';
+    document.getElementById('m-req').textContent = req + ' ops';
+    document.getElementById('m-cpu').textContent = cpu + '%';
+    document.getElementById('m-ping').textContent = ping + ' ms';
+  }, 2500);
+  function updateCalc(val) {
+    const price = (val * 7).toLocaleString();
+    document.getElementById('calc-out').textContent = val + ' TB / $' + price + ' mo';
+  }
+  function openModal() {
+    document.getElementById('auth-err').style.display = 'none';
+    document.getElementById('auth-modal').style.display = 'flex';
+  }
+  function closeModal() {
+    document.getElementById('auth-modal').style.display = 'none';
+  }
+  function handleAuth(e) {
+    e.preventDefault();
+    document.getElementById('auth-err').style.display = 'block';
+  }
+</script>
+</body>
+</html>
+FS_VAPEN_INDEX_EOF
+    cat <<'FS_VAPEN_ERR_EOF' > /var/www/myfakesite/error.html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="robots" content="noindex, nofollow">
+  <title>VAPEN Cloud Storage | S3 Gateway Security Exception</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🛡️</text></svg>">
+  <style>
+    :root {
+      --bg-main: #060911;
+      --bg-card: #0f1626;
+      --border: #1e293b;
+      --text-main: #f8fafc;
+      --text-muted: #94a3b8;
+      --accent: #3b82f6;
+      --warn: #f59e0b;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background-color: var(--bg-main);
+      color: var(--text-main);
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+      background-image: radial-gradient(circle at 50% 0%, #17152b 0%, var(--bg-main) 65%);
+    }
+    header { border-bottom: 1px solid var(--border); padding: 1.2rem 2rem; display: flex; justify-content: space-between; align-items: center; }
+    .logo { font-weight: 700; font-size: 1.15rem; color: var(--text-main); text-decoration: none; display: flex; align-items: center; gap: 8px; }
+    .badge { background: rgba(245, 158, 11, 0.15); border: 1px solid rgba(245, 158, 11, 0.4); color: var(--warn); font-size: 0.75rem; padding: 3px 10px; border-radius: 999px; font-family: monospace; }
+    main { max-width: 680px; width: 100%; margin: 3rem auto; padding: 0 1.5rem; }
+    .waf-card { background: var(--bg-card); border: 1px solid var(--border); border-radius: 12px; padding: 2.25rem; box-shadow: 0 20px 45px rgba(0,0,0,0.5); }
+    .code-row { display: flex; align-items: center; gap: 12px; margin-bottom: 1rem; }
+    .status-dot { width: 12px; height: 12px; border-radius: 50%; background: var(--warn); box-shadow: 0 0 12px var(--warn); }
+    h1 { font-size: 1.65rem; letter-spacing: -0.01em; }
+    p.desc { color: var(--text-muted); font-size: 0.95rem; line-height: 1.6; margin-bottom: 1.5rem; }
+    .diag-box { background: #090d16; border: 1px solid var(--border); border-radius: 8px; padding: 1.1rem; font-family: monospace; font-size: 0.82rem; color: #cbd5e1; margin-bottom: 1.5rem; line-height: 1.7; overflow-x: auto; }
+    .diag-key { color: var(--text-muted); display: inline-block; width: 160px; }
+    .actions { display: flex; gap: 1rem; align-items: center; }
+    .btn { padding: 0.6rem 1.25rem; border-radius: 6px; font-size: 0.9rem; font-weight: 500; text-decoration: none; transition: all 0.2s; }
+    .btn-primary { background: var(--accent); color: #fff; }
+    .btn-primary:hover { background: #2563eb; }
+    .btn-outline { border: 1px solid var(--border); color: var(--text-muted); }
+    .btn-outline:hover { color: var(--text-main); background: rgba(255,255,255,0.03); }
+    footer { border-top: 1px solid var(--border); padding: 1.25rem 2rem; text-align: center; color: var(--text-muted); font-size: 0.8rem; }
+  </style>
+</head>
+<body>
+<header>
+  <a href="/" class="logo">☁️ VAPEN Cloud Storage <span style="color: var(--text-muted); font-weight: 400;">| S3 WAF</span></a>
+  <span class="badge">ERR_CODE: NoSuchBucketOrPolicy</span>
+</header>
+<main>
+  <div class="waf-card">
+    <div class="code-row">
+      <span class="status-dot"></span>
+      <h1>S3 Bucket Route Restricted / Unmapped URI</h1>
+    </div>
+    <p class="desc">
+      The requested object key or endpoint does not exist on this storage gateway, or your request lacks a valid AWS4-HMAC-SHA256 authorization signature.
+    </p>
+    <div class="diag-box">
+      <div><span class="diag-key">Gateway Status:</span> <span style="color: #f87171;">403 / 404 Filtered by S3 Object Policy</span></div>
+      <div><span class="diag-key">Requested Object:</span> <span id="req-path">/</span></div>
+      <div><span class="diag-key">WAF Action:</span> <span>DENY_UNSIGNED_S3_REQUEST</span></div>
+      <div><span class="diag-key">VAPEN Trace ID:</span> <span id="trace-id">generating...</span></div>
+      <div><span class="diag-key">Timestamp (UTC):</span> <span id="ts">syncing...</span></div>
+    </div>
+    <div class="actions">
+      <a href="/" class="btn btn-primary">← Return to Storage Portal</a>
+      <a href="/" class="btn btn-outline">Check Cluster Status</a>
+    </div>
+  </div>
+</main>
+<footer>
+  Protected by VAPEN Cloud Storage Autonomous WAF • TLS 1.3 Strict Enforcement • AS398102
+</footer>
+<script>
+  document.getElementById('req-path').textContent = window.location.pathname;
+  const trace = Array.from({length: 20}, () => Math.floor(Math.random()*16).toString(16)).join('').toUpperCase();
+  document.getElementById('trace-id').textContent = 'VLT-' + trace.slice(0,8) + '-' + trace.slice(8,16);
+  document.getElementById('ts').textContent = new Date().toISOString();
+</script>
+</body>
+</html>
+FS_VAPEN_ERR_EOF
+    sed -i "s|https://vapen-storage.internal|https://${DOMAIN}|g" /var/www/myfakesite/index.html
+
+    MASK_LOCATION_BLOCK=$(cat <<'EOF'
+        # Эмуляция S3 Object Storage API: AccessDenied в XML (Resource собирается только из безопасных символов)
+        location ~ ^/(?:s3|buckets)(?<s3path>/[A-Za-z0-9._~/-]*)?$ {
+            default_type application/xml;
+            limit_req zone=bot burst=20 nodelay;
+            add_header x-amz-request-id $request_id always;
+            add_header x-amz-id-2 "MzRISOwyjmnup+$request_id/VAPEN/s3-eu-central-1" always;
+            add_header x-amz-bucket-region "eu-central-1" always;
+            add_header Strict-Transport-Security "max-age=31536000; includeSubDomains; preload" always;
+            add_header X-Content-Type-Options "nosniff" always;
+            return 403 '<?xml version="1.0" encoding="UTF-8"?>\n<Error>\n  <Code>AccessDenied</Code>\n  <Message>Access Denied. Unsigned request or missing AWS4-HMAC-SHA256 authorization header.</Message>\n  <Resource>/s3$s3path</Resource>\n  <RequestId>$request_id</RequestId>\n  <HostId>MzRISOwyjmnup+$request_id/VAPEN-S3-FRA01</HostId>\n</Error>\n';
+        }
+
+        # Эмуляция JSON-эндпоинта статуса узла
+        location = /api/v1/health {
+            default_type application/json;
+            limit_req zone=bot burst=20 nodelay;
+            add_header Cache-Control "no-store, no-cache, must-revalidate" always;
+            add_header X-Vapen-Request-ID $request_id always;
+            add_header X-S3-Storage-Node "VLT-FRA-01" always;
+            add_header Strict-Transport-Security "max-age=31536000; includeSubDomains; preload" always;
+            add_header X-Content-Type-Options "nosniff" always;
+            return 200 '{"status":"healthy","service":"VAPEN Cloud Storage S3 Gateway","version":"4.2.1-enterprise","node_id":"VLT-FRA-01","region":"eu-central-1","storage_engine":"nvme-erasure-coding-v4","replication":"synced","tls_protocol":"$ssl_protocol","timestamp":"$time_iso8601","request_id":"$request_id"}\n';
+        }
+
+        # Страница WAF-ошибки портала (только для внутренних редиректов)
+        location = /error.html {
+            root /var/www/myfakesite;
+            internal;
+        }
+
+        location / {
+            limit_req zone=bot burst=20 nodelay;
+            limit_conn addr 20;
+            root /var/www/myfakesite;
+            index index.html;
+            try_files $uri $uri/ =404;
+            error_page 400 403 404 405 /error.html;
         }
 EOF
 )
@@ -701,7 +1390,7 @@ inbounds = [
                 "path": f"/{xhttp_one_path}/",
                 "host": domain,
                 "mode": "stream-one",
-                "noGRPCHeader": false,
+                "noGRPCHeader": False,
                 "xPaddingBytes": "100-1000",
                 "headers": browser_headers
             }
@@ -918,6 +1607,7 @@ http {
     limit_req_zone \$limit_ip zone=panel:10m rate=30r/s;
     limit_req_zone \$limit_ip zone=subs:1m rate=5r/m;
     limit_req_zone \$limit_ip zone=scan:1m rate=1r/s;
+    limit_req_zone \$limit_ip zone=fs_auth:10m rate=5r/m;
     limit_conn_zone \$limit_ip zone=addr:1m;
     limit_req_status 429;
 
@@ -1155,6 +1845,12 @@ failregex = ^<HOST> - \S+ \[.*?\] "(?:GET|POST|HEAD|OPTIONS|PUT|DELETE) .+ HTTP/
 ignoreregex =
 EOF
 
+cat <<'EOF' > /etc/fail2ban/filter.d/myfakesite-auth.conf
+[Definition]
+failregex = ^<HOST> - \S+ \[.*?\] "POST /api/auth(?:\?\S*)? HTTP/\d(?:\.\d)?" (?:401|429) \d+
+ignoreregex =
+EOF
+
 cat <<EOF > /etc/fail2ban/jail.local
 [DEFAULT]
 bantime = 24h
@@ -1178,6 +1874,16 @@ logpath = /var/log/nginx/access.log
 maxretry = 10
 findtime = 5m
 bantime = 12h
+
+[myfakesite-auth]
+enabled = true
+filter = myfakesite-auth
+port = http,https
+backend = polling
+logpath = /var/log/nginx/access.log
+maxretry = 5
+findtime = 10m
+bantime = 1h
 EOF
 systemctl enable --now fail2ban
 systemctl restart fail2ban
@@ -1682,7 +2388,7 @@ echo -e "  • Инбаунды:      XHTTP Packet-UP («Мобилы») + XHTTP
 echo -e "  • Пользователи:  не создавались (добавьте их в веб-панели 3x-ui)"
 echo -e "  • Роутинг Xray:  api->api + блокировка BitTorrent, Private IPs, Ads, Malware/Phishing"
 echo -e "  • UFW:           активен (открыты только SSH:${SSH_PORT}, 80, 443)"
-echo -e "  • Fail2Ban:      активен (sshd + nginx-scanners через nftables)"
+echo -e "  • Fail2Ban:      активен (sshd + nginx-scanners + myfakesite-auth через nftables)"
 echo -e "  • CrowdSec:      активен (crowdsec + nftables firewall bouncer)"
 echo -e "  • Блок сканеров: $([[ "$ENABLE_SCANNERS_BLOCK" =~ ^[Yy]$ ]] && echo 'C24Be + CyberOK Skipa (nftables prerouting drop)' || echo 'отключен (my3xui blocklist install)')"
 echo -e "  • CLI-утилита:   my3xui (info | creds | crowdsec | blocklist | clean)"
