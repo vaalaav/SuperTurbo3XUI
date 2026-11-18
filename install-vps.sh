@@ -75,16 +75,33 @@ LE_EMAIL=${LE_EMAIL:-"admin@${DOMAIN}"}
 
 echo -e "\n3. Режим маскировки основного домена (${DOMAIN}):"
 printf "   ${BOLD}%-13s${NC} — %s\n" "[Enter] / 1" "«Облачный диск»: mock API и форма входа (рекомендуется)"
-printf "   ${BOLD}%-13s${NC} — %s\n" "2 / vapen"   "«VAPEN Cloud Storage»: S3-эмуляция (/s3, /api/v1/health)"
+printf "   ${BOLD}%-13s${NC} — %s\n" "2 / vapen"   "Портал облачного хранилища под вашим названием (S3: /s3, /api/v1/health)"
 printf "   ${BOLD}%-13s${NC} — %s\n" "[URL]"       "Reverse Proxy на другой сайт (например, https://example.org)"
 read -erp "   Ваш выбор [1]: " MASK_INPUT
 MASK_INPUT=$(echo "$MASK_INPUT" | tr -d '[:space:]')
 REVERSE_PROXY_URL=""
 case "${MASK_INPUT,,}" in
-    ""|1|disk)  MASK_MODE="disk";  MASK_LABEL="Локальный сайт «Облачный диск»" ;;
-    2|vapen)    MASK_MODE="vapen"; MASK_LABEL="Локальный портал «VAPEN Cloud Storage»" ;;
+    ""|1|disk)  MASK_MODE="disk";  MASK_LABEL="Локальный сайт облачного хранилища" ;;
+    2|vapen)    MASK_MODE="vapen"; MASK_LABEL="Локальный портал облачного хранилища" ;;
     *)          MASK_MODE="proxy"; REVERSE_PROXY_URL="$MASK_INPUT"; MASK_LABEL="Reverse Proxy → ${MASK_INPUT}" ;;
 esac
+
+COMPANY_NAME=""; COMPANY_SLUG="STORAGE"
+if [[ "$MASK_MODE" == "vapen" || "$MASK_MODE" == "disk" ]]; then
+    COMPANY_RE='^[A-Za-z0-9][A-Za-z0-9 ._-]{1,31}$'
+    while true; do
+        DEFAULT_CO=$( [[ "$MASK_MODE" == "vapen" ]] && echo "VAPEN" || echo "Облачный диск" )
+    read -erp "   Название компании для сайта (например, Nimbus Labs) [${DEFAULT_CO}]: " COMPANY_NAME
+        COMPANY_NAME=$(echo "$COMPANY_NAME" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        COMPANY_NAME=$(echo "$COMPANY_NAME" | sed -E 's/[[:space:]]+[Cc]loud[[:space:]]+[Ss]torage$//')  # суффикс добавляется автоматически
+        COMPANY_NAME=${COMPANY_NAME:-${DEFAULT_CO}}
+        [[ "$COMPANY_NAME" =~ $COMPANY_RE ]] && break
+        echo -e "   ${RED}Допустимы латинские буквы, цифры, пробел и символы . _ - (от 2 до 32 символов).${NC}"
+    done
+    COMPANY_SLUG=$(echo "$COMPANY_NAME" | tr -cd 'A-Za-z0-9' | tr 'a-z' 'A-Z' | cut -c1-16)
+    COMPANY_SLUG=${COMPANY_SLUG:-STORAGE}
+    MASK_LABEL="Локальный портал «${COMPANY_NAME} Cloud Storage»"
+fi
 
 # Генерация сложных случайных логина (12 симв.) и пароля (20 симв. со спецсимволами)
 RAND_USER=$(python3 -c 'import secrets, string; alphabet = string.ascii_letters + string.digits; print("".join(secrets.choice(alphabet) for _ in range(12)))')
@@ -267,7 +284,7 @@ mkdir -p /var/cache/nginx/img_cache /var/cache/nginx/html_cache /var/www/myfakes
 touch /var/log/nginx/access.log /var/log/nginx/error.log
 
 if [[ "$MASK_MODE" == "disk" ]]; then
-    log_info "Установка локального сайта-заглушки «Облачный диск» (mock API, без Docker/PHP)..."
+    log_info "Установка локального сайта-заглушки «${COMPANY_NAME}» (mock API, без Docker/PHP)..."
     cat <<'FS_HTML_EOF' > /var/www/myfakesite/index.html
 <!DOCTYPE html>
 <html lang="ru">
@@ -275,8 +292,8 @@ if [[ "$MASK_MODE" == "disk" ]]; then
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex, nofollow">
-<title>Облачный диск — вход</title>
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Cpath fill='%230f7b6c' d='M18 48a12 12 0 0 1-1-24 16 16 0 0 1 30 4 10 10 0 0 1 0 20z'/%3E%3C/svg%3E">
+<title>@@DISK_COMPANY@@ — вход</title>
+<link rel="icon" href="/favicon.svg">
 <link rel="stylesheet" href="/style.css">
 </head>
 <body>
@@ -285,7 +302,7 @@ if [[ "$MASK_MODE" == "disk" ]]; then
     <section class="intro" aria-label="О сервисе">
       <div class="brand">
         <svg viewBox="0 0 64 64" aria-hidden="true"><path fill="var(--accent)" d="M18 50a13 13 0 0 1-1.5-25.9A17 17 0 0 1 49 27a11 11 0 0 1-1 23z"/><path fill="var(--surface)" d="M32 28l-8 9h5v8h6v-8h5z"/></svg>
-        <span>Облачный диск</span>
+        <span>@@DISK_COMPANY@@</span>
       </div>
       <h1>Ваши файлы всегда под рукой</h1>
       <p>Храните документы, фото и архивы в одном месте и делитесь ссылками с коллегами. Доступ только по приглашению.</p>
@@ -467,7 +484,26 @@ FS_CSS_EOF
 })();
 FS_JS_EOF
 
+    sed -i "s|@@DISK_COMPANY@@|${COMPANY_NAME}|g" /var/www/myfakesite/index.html
+
+    # Генерируем favicon.svg с первой буквой названия компании (как в VAPEN-режиме)
+    FAVICON_LETTER="${COMPANY_NAME:0:1}"
+    cat > /var/www/myfakesite/favicon.svg <<FAVEOF
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">
+  <rect width="100" height="100" rx="20" fill="#0f7b6c"/>
+  <text x="50" y="68" font-size="62" font-family="system-ui,sans-serif" font-weight="700"
+        text-anchor="middle" fill="#ffffff">${FAVICON_LETTER}</text>
+</svg>
+FAVEOF
+
     MASK_LOCATION_BLOCK=$(cat <<'EOF'
+        location = /favicon.svg {
+            root /var/www/myfakesite;
+            access_log off;
+            expires 7d;
+            add_header Cache-Control "public, immutable" always;
+        }
+
         # Mock API «облачного диска» (ответы отдаёт сам nginx)
         location = /api/status {
             default_type application/json;
@@ -515,26 +551,26 @@ FS_JS_EOF
 EOF
 )
 elif [[ "$MASK_MODE" == "vapen" ]]; then
-    log_info "Установка локального портала «VAPEN Cloud Storage» (S3-эмуляция, без Docker/PHP)..."
+    log_info "Установка локального портала «${COMPANY_NAME} Cloud Storage» (S3-эмуляция, без Docker/PHP)..."
     cat <<'FS_VAPEN_INDEX_EOF' > /var/www/myfakesite/index.html
 <!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <meta name="description" content="VAPEN Cloud Storage — Enterprise S3-Compatible Object Storage, Distributed NVMe Clusters, and Global Edge Content Delivery.">
-  <meta name="keywords" content="VAPEN Cloud Storage, S3 Object Storage, NVMe Cloud, Distributed Storage, Zero-Knowledge Encryption, Edge CDN">
+  <meta name="description" content="@@COMPANY@@ Cloud Storage — Enterprise S3-Compatible Object Storage, Distributed NVMe Clusters, and Global Edge Content Delivery.">
+  <meta name="keywords" content="@@COMPANY@@ Cloud Storage, S3 Object Storage, NVMe Cloud, Distributed Storage, Zero-Knowledge Encryption, Edge CDN">
   <meta name="robots" content="noindex, nofollow">
-  <meta property="og:title" content="VAPEN Cloud Storage | Enterprise Object Storage & Edge Network">
+  <meta property="og:title" content="@@COMPANY@@ Cloud Storage | Enterprise Object Storage & Edge Network">
   <meta property="og:description" content="High-throughput S3-compatible NVMe object storage with immutable backups and global Anycast replication.">
   <meta property="og:type" content="website">
-  <title>VAPEN Cloud Storage | Enterprise NVMe Object Storage & Edge Telemetry</title>
+  <title>@@COMPANY@@ Cloud Storage | Enterprise NVMe Object Storage & Edge Telemetry</title>
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>☁️</text></svg>">
   <script type="application/ld+json">
   {
     "@context": "https://schema.org",
     "@type": "Organization",
-    "name": "VAPEN Cloud Storage",
+    "name": "@@COMPANY@@ Cloud Storage",
     "description": "Enterprise S3 Object Storage and Distributed Edge Infrastructure",
     "url": "https://vapen-storage.internal"
   }
@@ -631,7 +667,7 @@ elif [[ "$MASK_MODE" == "vapen" ]]; then
 <body>
 <header>
   <div class="container nav-bar">
-    <a href="#" class="logo">☁️ VAPEN Cloud Storage <span class="logo-badge">S3 Edge v4.2</span></a>
+    <a href="#" class="logo">☁️ @@COMPANY@@ Cloud Storage <span class="logo-badge">S3 Edge v4.2</span></a>
     <nav>
       <ul>
         <li><a href="#network">Storage Clusters</a></li>
@@ -694,7 +730,7 @@ elif [[ "$MASK_MODE" == "vapen" ]]; then
 <section id="network" class="section">
   <div class="container">
     <h2 class="section-title">Multi-Region Replication Status</h2>
-    <p class="section-sub">Real-time erasure coding health and backbone synchronization across primary Tier-4 VAPEN storage vaults.</p>
+    <p class="section-sub">Real-time erasure coding health and backbone synchronization across primary Tier-4 @@COMPANY@@ storage vaults.</p>
     <div class="table-wrap">
       <table>
         <thead>
@@ -749,7 +785,7 @@ elif [[ "$MASK_MODE" == "vapen" ]]; then
 </section>
 <section id="products" class="section">
   <div class="container">
-    <h2 class="section-title">VAPEN Enterprise Storage Stack</h2>
+    <h2 class="section-title">@@COMPANY@@ Enterprise Storage Stack</h2>
     <p class="section-sub">Engineered for AI dataset training, Kubernetes persistent volumes, and immutable archival.</p>
     <div class="grid-3">
       <div class="card">
@@ -782,7 +818,7 @@ elif [[ "$MASK_MODE" == "vapen" ]]; then
   <div class="container">
     <div class="footer-grid">
       <div class="footer-col">
-        <h4>☁️ VAPEN Cloud Storage</h4>
+        <h4>☁️ @@COMPANY@@ Cloud Storage</h4>
         <p>Enterprise distributed NVMe object storage, S3 edge caching, and encrypted archival infrastructure. ISO/IEC 27001 & SOC2 Type II Certified.</p>
       </div>
       <div class="footer-col">
@@ -811,14 +847,14 @@ elif [[ "$MASK_MODE" == "vapen" ]]; then
       </div>
     </div>
     <div style="border-top: 1px solid var(--border); padding-top: 1.5rem; display: flex; justify-content: space-between;">
-      <span>© 2026 VAPEN Cloud Storage. All rights reserved.</span>
+      <span>© 2026 @@COMPANY@@ Cloud Storage. All rights reserved.</span>
       <span>TLS 1.3 End-to-End Encrypted Session</span>
     </div>
   </div>
 </footer>
 <div class="modal-backdrop" id="auth-modal">
   <div class="modal">
-    <h3 style="margin-bottom: 0.5rem;">VAPEN Storage Console</h3>
+    <h3 style="margin-bottom: 0.5rem;">@@COMPANY@@ Storage Console</h3>
     <p style="color: var(--text-muted); font-size: 0.85rem; margin-bottom: 1rem;">Sign in with your Tenant Access Key or Corporate SAML 2.0 SSO.</p>
     <form onsubmit="handleAuth(event)">
       <label style="font-size: 0.8rem; color: var(--text-muted);">Tenant ID / Corporate Email</label>
@@ -878,7 +914,7 @@ FS_VAPEN_INDEX_EOF
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="robots" content="noindex, nofollow">
-  <title>VAPEN Cloud Storage | S3 Gateway Security Exception</title>
+  <title>@@COMPANY@@ Cloud Storage | S3 Gateway Security Exception</title>
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🛡️</text></svg>">
   <style>
     :root {
@@ -923,7 +959,7 @@ FS_VAPEN_INDEX_EOF
 </head>
 <body>
 <header>
-  <a href="/" class="logo">☁️ VAPEN Cloud Storage <span style="color: var(--text-muted); font-weight: 400;">| S3 WAF</span></a>
+  <a href="/" class="logo">☁️ @@COMPANY@@ Cloud Storage <span style="color: var(--text-muted); font-weight: 400;">| S3 WAF</span></a>
   <span class="badge">ERR_CODE: NoSuchBucketOrPolicy</span>
 </header>
 <main>
@@ -939,7 +975,7 @@ FS_VAPEN_INDEX_EOF
       <div><span class="diag-key">Gateway Status:</span> <span style="color: #f87171;">403 / 404 Filtered by S3 Object Policy</span></div>
       <div><span class="diag-key">Requested Object:</span> <span id="req-path">/</span></div>
       <div><span class="diag-key">WAF Action:</span> <span>DENY_UNSIGNED_S3_REQUEST</span></div>
-      <div><span class="diag-key">VAPEN Trace ID:</span> <span id="trace-id">generating...</span></div>
+      <div><span class="diag-key">@@COMPANY@@ Trace ID:</span> <span id="trace-id">generating...</span></div>
       <div><span class="diag-key">Timestamp (UTC):</span> <span id="ts">syncing...</span></div>
     </div>
     <div class="actions">
@@ -949,7 +985,7 @@ FS_VAPEN_INDEX_EOF
   </div>
 </main>
 <footer>
-  Protected by VAPEN Cloud Storage Autonomous WAF • TLS 1.3 Strict Enforcement • AS398102
+  Protected by @@COMPANY@@ Cloud Storage Autonomous WAF • TLS 1.3 Strict Enforcement • AS398102
 </footer>
 <script>
   document.getElementById('req-path').textContent = window.location.pathname;
@@ -961,6 +997,7 @@ FS_VAPEN_INDEX_EOF
 </html>
 FS_VAPEN_ERR_EOF
     sed -i "s|https://vapen-storage.internal|https://${DOMAIN}|g" /var/www/myfakesite/index.html
+    sed -i "s|@@COMPANY@@|${COMPANY_NAME}|g" /var/www/myfakesite/index.html /var/www/myfakesite/error.html
 
     MASK_LOCATION_BLOCK=$(cat <<'EOF'
         # Эмуляция S3 Object Storage API: AccessDenied в XML (Resource собирается только из безопасных символов)
@@ -968,11 +1005,11 @@ FS_VAPEN_ERR_EOF
             default_type application/xml;
             limit_req zone=bot burst=20 nodelay;
             add_header x-amz-request-id $request_id always;
-            add_header x-amz-id-2 "MzRISOwyjmnup+$request_id/VAPEN/s3-eu-central-1" always;
+            add_header x-amz-id-2 "MzRISOwyjmnup+$request_id/s3-eu-central-1" always;
             add_header x-amz-bucket-region "eu-central-1" always;
             add_header Strict-Transport-Security "max-age=31536000; includeSubDomains; preload" always;
             add_header X-Content-Type-Options "nosniff" always;
-            return 403 '<?xml version="1.0" encoding="UTF-8"?>\n<Error>\n  <Code>AccessDenied</Code>\n  <Message>Access Denied. Unsigned request or missing AWS4-HMAC-SHA256 authorization header.</Message>\n  <Resource>/s3$s3path</Resource>\n  <RequestId>$request_id</RequestId>\n  <HostId>MzRISOwyjmnup+$request_id/VAPEN-S3-FRA01</HostId>\n</Error>\n';
+            return 403 '<?xml version="1.0" encoding="UTF-8"?>\n<Error>\n  <Code>AccessDenied</Code>\n  <Message>Access Denied. Unsigned request or missing AWS4-HMAC-SHA256 authorization header.</Message>\n  <Resource>/s3$s3path</Resource>\n  <RequestId>$request_id</RequestId>\n  <HostId>MzRISOwyjmnup+$request_id/@@SLUG@@-S3-FRA01</HostId>\n</Error>\n';
         }
 
         # Эмуляция JSON-эндпоинта статуса узла
@@ -980,11 +1017,11 @@ FS_VAPEN_ERR_EOF
             default_type application/json;
             limit_req zone=bot burst=20 nodelay;
             add_header Cache-Control "no-store, no-cache, must-revalidate" always;
-            add_header X-Vapen-Request-ID $request_id always;
+            add_header X-Request-ID $request_id always;
             add_header X-S3-Storage-Node "VLT-FRA-01" always;
             add_header Strict-Transport-Security "max-age=31536000; includeSubDomains; preload" always;
             add_header X-Content-Type-Options "nosniff" always;
-            return 200 '{"status":"healthy","service":"VAPEN Cloud Storage S3 Gateway","version":"4.2.1-enterprise","node_id":"VLT-FRA-01","region":"eu-central-1","storage_engine":"nvme-erasure-coding-v4","replication":"synced","tls_protocol":"$ssl_protocol","timestamp":"$time_iso8601","request_id":"$request_id"}\n';
+            return 200 '{"status":"healthy","service":"@@COMPANY@@ Cloud Storage S3 Gateway","version":"4.2.1-enterprise","node_id":"VLT-FRA-01","region":"eu-central-1","storage_engine":"nvme-erasure-coding-v4","replication":"synced","tls_protocol":"$ssl_protocol","timestamp":"$time_iso8601","request_id":"$request_id"}\n';
         }
 
         # Страница WAF-ошибки портала (только для внутренних редиректов)
@@ -1003,6 +1040,8 @@ FS_VAPEN_ERR_EOF
         }
 EOF
 )
+    MASK_LOCATION_BLOCK=${MASK_LOCATION_BLOCK//@@COMPANY@@/${COMPANY_NAME}}
+    MASK_LOCATION_BLOCK=${MASK_LOCATION_BLOCK//@@SLUG@@/${COMPANY_SLUG}}
 else
     RP_HOST=$(echo "$REVERSE_PROXY_URL" | sed -E 's|^https?://||; s|/.*$||')
     RP_SCHEME=$(echo "$REVERSE_PROXY_URL" | grep -oE '^https?' || echo "https")
