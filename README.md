@@ -34,6 +34,9 @@
 
 Подключитесь к VPS по SSH под пользователем `root`. Скачайте установщик и запустите его:
 
+> [!CAUTION]
+> **Для установки требуется чистый VPS и домен, привязанный к IP-адресу VPS.**
+
 ```bash
 curl -fsSL https://raw.githubusercontent.com/vaalaav/SuperTurbo3XUI/main/install-vps.sh -o install-vps.sh
 bash install-vps.sh
@@ -189,6 +192,8 @@ SuperTurbo3XUI использует следующие сторонние ком
 - [Certbot](https://certbot.eff.org/) — получение и продление SSL-сертификатов.
 - [CrowdSec](https://www.crowdsec.net/) — анализ событий безопасности.
 - [Fail2Ban](https://github.com/fail2ban/fail2ban) — защита от подозрительных попыток доступа.
+- [C24Be / AS_Network_List](https://github.com/C24Be/AS_Network_List) — списки IP-подсетей и инструменты для их применения.
+- [CyberOK / Skipa IPs](https://github.com/tread-lightly/CyberOK_Skipa_ips) — список IP-адресов сканеров SKIPA.
 - [UFW](https://launchpad.net/ufw) и [nftables](https://netfilter.org/projects/nftables/) — управление сетевой фильтрацией.
 
 ## 📄 Лицензия и ответственность
