@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -Eeuo pipefail
 
 # ============================================================================
-# Установщик 3x-ui 3.11+ + Nginx HTTP/2 XHTTP + Security Stack (v7)
+# Установщик 3x-ui 3.11+ + Nginx HTTP/2 XHTTP + Security Stack (v7.1)
 # Инбаунды: XHTTP Packet-UP ("Мобилы") + Stream-One ("Домашний") + TCP Reality Self-Steal ("Reality") без клиентов
 # Маршрутизация: api->api, блокировка BitTorrent, Private IPs, Ads, Malware
 # Поддержка: Ubuntu 24.04 LTS | Маска: CloudDisk (mock API) / VAPEN Cloud Storage (S3) / Reverse Proxy
@@ -10,12 +10,16 @@ set -euo pipefail
 #
 # Неинтерактивный запуск (пример):
 #   NON_INTERACTIVE=1 DOMAIN=node.example.com MASK_MODE=vapen COMPANY_NAME="VAPEN" \
-#   ENABLE_SCANNERS_BLOCK=Y SKIP_UPGRADE=1 bash install-vps-v7.sh
+#   ENABLE_SCANNERS_BLOCK=Y SKIP_UPGRADE=1 bash install-vps-fixed.sh
 # Доступные переменные окружения:
 #   NON_INTERACTIVE=1, AUTO_CONFIRM=1, SKIP_UPGRADE=1, AUTO_UPGRADE=1,
-#   IGNORE_DNS_CHECK=1, SSH_NEW_PORT=2222, DOMAIN, LE_EMAIL, MASK_MODE (disk|vapen|proxy),
-#   COMPANY_NAME, REVERSE_PROXY_URL, PANEL_USER, PANEL_PASS, ENABLE_SCANNERS_BLOCK (Y|N)
+#   IGNORE_DNS_CHECK=1, SSH_NEW_PORT=2222, XUI_VERSION=v3.11.0, DOMAIN, LE_EMAIL,
+#   MASK_MODE (disk|vapen|proxy), COMPANY_NAME, REVERSE_PROXY_URL,
+#   PANEL_USER, PANEL_PASS, ENABLE_SCANNERS_BLOCK (Y|N)
 # ============================================================================
+
+export DEBIAN_FRONTEND=noninteractive
+export NEEDRESTART_MODE=a
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -26,8 +30,11 @@ NC='\033[0m'
 
 LOG_FILE="/var/log/my3xui-install.log"
 LOG_STREAM_ACTIVE=0
+TEE_PID=""
 NON_INTERACTIVE="${NON_INTERACTIVE:-0}"
 AUTO_CONFIRM="${AUTO_CONFIRM:-$NON_INTERACTIVE}"
+MIN_XUI_VERSION="3.11.0"
+XUI_VERSION="${XUI_VERSION:-}"
 
 _log_file_write() {
     if [[ "${LOG_STREAM_ACTIVE}" -eq 0 && -w "${LOG_FILE}" ]]; then
@@ -40,11 +47,46 @@ log_ok()    { echo -e "${GREEN}[OK]${NC} $1";   _log_file_write "[OK] $1"; }
 log_warn()  { echo -e "${YELLOW}[WARN]${NC} $1"; _log_file_write "[WARN] $1"; }
 log_err()   { echo -e "${RED}[ERROR]${NC} $1";  _log_file_write "[ERROR] $1"; exit 1; }
 
-# 1. Проверка прав, инициализация лога и проверка ОС (только Ubuntu 24.04 LTS)
+_on_error() {
+    local exit_code=$?
+    local line_no="${1:-?}"
+    local failed_cmd="${2:-?}"
+    echo -e "${RED}[ERROR]${NC} Сбой установки на строке ${line_no} (код ${exit_code}): ${failed_cmd}" >&2
+    _log_file_write "[ERROR] Сбой установки на строке ${line_no} (код ${exit_code}): ${failed_cmd}"
+    echo -e "${YELLOW}[INFO]${NC} Подробности смотрите в логе: ${LOG_FILE}" >&2
+}
+
+_cleanup_log_stream() {
+    if [[ "${LOG_STREAM_ACTIVE}" -eq 1 ]]; then
+        LOG_STREAM_ACTIVE=0
+        exec 1>&3 2>&4 3>&- 4>&- 2>/dev/null || true
+        if [[ -n "${TEE_PID}" ]]; then
+            wait "${TEE_PID}" 2>/dev/null || true
+        fi
+    fi
+}
+
+trap '_on_error "$LINENO" "$BASH_COMMAND"' ERR
+trap '_cleanup_log_stream' EXIT
+
+# 1. Проверка прав, инициализация лога, валидация XUI_VERSION (>= 3.11.0) и проверка ОС (только Ubuntu 24.04 LTS)
 [[ $EUID -ne 0 ]] && log_err "Запустите скрипт от имени root (sudo bash $0)."
 
 touch "${LOG_FILE}" && chmod 600 "${LOG_FILE}"
-_log_file_write "=== Запуск установщика 3x-ui v7 ==="
+_log_file_write "=== Запуск установщика 3x-ui v7.1 ==="
+
+if [[ -n "${XUI_VERSION}" ]]; then
+    _xui_ver_clean="${XUI_VERSION#v}"
+    if [[ ! "${_xui_ver_clean}" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)(-[A-Za-z0-9.]+)?$ ]]; then
+        log_err "Некорректный формат XUI_VERSION=${XUI_VERSION} (ожидается, например, v3.11.0)."
+    fi
+    _xui_maj="${BASH_REMATCH[1]}"
+    _xui_min="${BASH_REMATCH[2]}"
+    if (( 10#${_xui_maj} < 3 || ( 10#${_xui_maj} == 3 && 10#${_xui_min} < 11 ) )); then
+        log_err "Указана версия 3x-ui (${XUI_VERSION}) ниже минимально поддерживаемой (v${MIN_XUI_VERSION})."
+    fi
+    XUI_VERSION="v${_xui_ver_clean}"
+fi
 
 if [[ -f /etc/os-release ]]; then
     . /etc/os-release
@@ -60,51 +102,83 @@ else
     log_err "Не удалось определить ОС (/etc/os-release не найден)."
 fi
 
-# Защита нестандартного порта SSH на Ubuntu 24.04 (отключение ssh.socket -> ssh.service)
+# Перевод SSH на ssh.service (Ubuntu 24.04) и опциональная смена порта SSH
+# Отключаем ssh.socket безусловно (и для 22, и для нестандартного порта), чтобы:
+# 1) нестандартный порт не сбрасывался после apt upgrade / перезагрузки;
+# 2) Fail2Ban и CrowdSec стабильно видели логи sshd в systemd journal (ssh.service).
 ensure_ssh_service_mode() {
     mkdir -p /run/sshd
-    local cfg_port=""
-    if command -v sshd >/dev/null 2>&1; then
-        cfg_port=$(sshd -T 2>/dev/null | awk '/^port / {print $2; exit}' || true)
+    local ssh_state_file="/etc/my3xui-ssh-state"
+    if [[ ! -f "${ssh_state_file}" ]]; then
+        local sock_was_enabled=0
+        if systemctl is-active --quiet ssh.socket 2>/dev/null || systemctl is-enabled --quiet ssh.socket 2>/dev/null; then
+            sock_was_enabled=1
+        fi
+        printf "SSH_SOCKET_WAS_ENABLED=%s\nCREATED_CUSTOM_PORT_CONF=0\n" "${sock_was_enabled}" > "${ssh_state_file}"
+        chmod 600 "${ssh_state_file}"
     fi
+
+    local cfg_ports=""
+    if command -v sshd >/dev/null 2>&1; then
+        cfg_ports=$(sshd -T 2>/dev/null | awk '/^port / {print $2}' | sort -u | tr '\n' ' ' | sed 's/ $//' || true)
+    fi
+    local cfg_port="${cfg_ports%% *}"
     cfg_port=${cfg_port:-22}
 
     # Опциональная смена порта SSH через переменную окружения SSH_NEW_PORT
+    local port_changed=0
     if [[ -n "${SSH_NEW_PORT:-}" ]]; then
         if ! [[ "${SSH_NEW_PORT}" =~ ^[0-9]+$ ]] || [[ "${SSH_NEW_PORT}" -lt 1 || "${SSH_NEW_PORT}" -gt 65535 ]]; then
             log_err "Некорректный порт SSH_NEW_PORT=${SSH_NEW_PORT} (допустимо 1..65535)."
         fi
-        if [[ "${SSH_NEW_PORT}" != "${cfg_port}" ]]; then
+        if [[ "${cfg_ports}" != "${SSH_NEW_PORT}" ]]; then
             log_info "Настройка порта SSH на ${SSH_NEW_PORT} (/etc/ssh/sshd_config.d/99-custom-port.conf)..."
             mkdir -p /etc/ssh/sshd_config.d
+            # В OpenSSH директива Port аддитивна: комментируем старые Port в sshd_config и других drop-in,
+            # иначе sshd будет слушать одновременно и старый, и новый порт.
+            if [[ -f /etc/ssh/sshd_config && ! -f /etc/ssh/sshd_config.my3xui.bak ]]; then
+                cp -a /etc/ssh/sshd_config /etc/ssh/sshd_config.my3xui.bak
+            fi
+            if [[ -f /etc/ssh/sshd_config ]]; then
+                sed -i -E 's/^[[:space:]]*Port[[:space:]]+/#Port /I' /etc/ssh/sshd_config
+            fi
+            local dropin
+            for dropin in /etc/ssh/sshd_config.d/*.conf; do
+                [[ -f "$dropin" && "$dropin" != "/etc/ssh/sshd_config.d/99-custom-port.conf" ]] || continue
+                if grep -qiE '^[[:space:]]*Port[[:space:]]+' "$dropin"; then
+                    [[ ! -f "${dropin}.my3xui.bak" ]] && cp -a "$dropin" "${dropin}.my3xui.bak"
+                    sed -i -E 's/^[[:space:]]*Port[[:space:]]+/#Port /I' "$dropin"
+                fi
+            done
             printf "Port %s\n" "${SSH_NEW_PORT}" > /etc/ssh/sshd_config.d/99-custom-port.conf
             if ! sshd -t 2>/dev/null; then
                 rm -f /etc/ssh/sshd_config.d/99-custom-port.conf
+                [[ -f /etc/ssh/sshd_config.my3xui.bak ]] && cp -a /etc/ssh/sshd_config.my3xui.bak /etc/ssh/sshd_config
+                for dropin in /etc/ssh/sshd_config.d/*.conf.my3xui.bak; do
+                    [[ -f "$dropin" ]] && mv -f "$dropin" "${dropin%.my3xui.bak}"
+                done
                 log_err "Ошибка проверки конфигурации sshd после смены порта на ${SSH_NEW_PORT}."
             fi
+            sed -i 's/^CREATED_CUSTOM_PORT_CONF=.*/CREATED_CUSTOM_PORT_CONF=1/' "${ssh_state_file}"
             cfg_port="${SSH_NEW_PORT}"
+            port_changed=1
         fi
     fi
 
-    # Если задан нестандартный порт SSH, отключаем ssh.socket и переводим на ssh.service,
-    # иначе после apt upgrade или перезагрузки Ubuntu 24.04 сбросит порт обратно на 22.
-    if [[ "${cfg_port}" != "22" ]]; then
-        if systemctl is-active --quiet ssh.socket 2>/dev/null || systemctl is-enabled --quiet ssh.socket 2>/dev/null; then
-            log_warn "Обнаружен нестандартный порт SSH (${cfg_port}) при активном ssh.socket (Ubuntu 24.04)."
-            log_info "Отключение ssh.socket и перевод SSH на ssh.service для сохранения порта после перезагрузки..."
-            if sshd -t 2>/dev/null; then
-                systemctl disable --now ssh.socket >/dev/null 2>&1 || true
-                systemctl enable --now ssh.service >/dev/null 2>&1 || true
-                systemctl restart ssh.service
-                log_ok "SSH переведён на ssh.service (порт ${cfg_port} зафиксирован)."
-            else
-                log_warn "sshd -t вернул ошибку — ssh.socket не изменён. Проверьте /etc/ssh/sshd_config вручную!"
-            fi
-        elif [[ -n "${SSH_NEW_PORT:-}" ]]; then
+    if systemctl is-active --quiet ssh.socket 2>/dev/null || systemctl is-enabled --quiet ssh.socket 2>/dev/null; then
+        log_info "Отключение ssh.socket и перевод SSH на ssh.service (порт ${cfg_port})..."
+        if sshd -t 2>/dev/null; then
+            systemctl disable --now ssh.socket >/dev/null 2>&1 || true
             systemctl enable --now ssh.service >/dev/null 2>&1 || true
             systemctl restart ssh.service
-            log_ok "SSH перезапущен на порту ${cfg_port}."
+            log_ok "SSH переведён на ssh.service (порт ${cfg_port} зафиксирован)."
+        else
+            log_warn "sshd -t вернул ошибку — ssh.socket не изменён. Проверьте /etc/ssh/sshd_config вручную!"
         fi
+    elif [[ "${port_changed}" -eq 1 ]]; then
+        systemctl enable --now ssh.service >/dev/null 2>&1 || true
+        systemctl restart ssh.service
+        log_ok "SSH перезапущен на порту ${cfg_port}."
     fi
 }
 
@@ -120,6 +194,7 @@ Acquire::BrokenProxy "true";
 Acquire::http::Timeout "15";
 Acquire::https::Timeout "15";
 Acquire::Retries "2";
+DPkg::Lock::Timeout "120";
 EOF
 }
 
@@ -246,7 +321,24 @@ elif [[ -n "$SERVER_IP" ]] && ! grep -qx "$SERVER_IP" <<< "$DOMAIN_IPS"; then
         [[ ! "$dns_cont" =~ ^[Yy]$ ]] && exit 1
     fi
 else
-    log_ok "DNS-проверка пройдена: ${DOMAIN} -> ${SERVER_IP:-OK}"
+    log_ok "DNS-проверка IPv4 (A) пройдена: ${DOMAIN} -> ${SERVER_IP:-OK}"
+fi
+
+SERVER_IPV6=$(curl -6 -fsSL --max-time 5 https://api6.ipify.org 2>/dev/null || true)
+DOMAIN_IPS_V6=$(getent ahostsv6 "$DOMAIN" 2>/dev/null | awk '{print $1}' | sort -u || true)
+if [[ -n "$DOMAIN_IPS_V6" ]]; then
+    if [[ -z "$SERVER_IPV6" ]] || ! grep -qx "$SERVER_IPV6" <<< "$DOMAIN_IPS_V6"; then
+        log_warn "У домена ${DOMAIN} обнаружена AAAA-запись (${DOMAIN_IPS_V6//$'\n'/, }), но IPv6 сервера: ${SERVER_IPV6:-отсутствует}!"
+        log_warn "Let's Encrypt при наличии AAAA-записи проверяет домен по IPv6, и выпуск SSL может завершиться ошибкой."
+        if [[ "${NON_INTERACTIVE}" == "1" ]]; then
+            [[ "${IGNORE_DNS_CHECK:-0}" != "1" ]] && log_err "AAAA-запись не соответствует серверу (удалите AAAA или укажите IGNORE_DNS_CHECK=1)."
+        else
+            read -erp "Всё равно продолжить выпуск сертификата? [y/N]: " dns6_cont
+            [[ ! "$dns6_cont" =~ ^[Yy]$ ]] && exit 1
+        fi
+    else
+        log_ok "DNS-проверка IPv6 (AAAA) пройдена: ${DOMAIN} -> ${SERVER_IPV6}"
+    fi
 fi
 
 if [[ -n "${LE_EMAIL:-}" ]]; then
@@ -383,32 +475,61 @@ SUB_PATH=$(openssl rand -hex 12)
 XHTTP_UP_PATH="media/ts/$(openssl rand -hex 4)"
 XHTTP_ONE_PATH="media/ts/1080/$(openssl rand -hex 4)"
 
-# Надёжное определение порта SSH и IP текущей сессии администратора
+# Надёжное определение всех портов SSH и IP текущей сессии администратора
 mkdir -p /run/sshd
-SSH_PORT=""
-if command -v sshd >/dev/null 2>&1; then
-    SSH_PORT=$(sshd -T 2>/dev/null | awk '/^port / {print $2; exit}' || true)
+mapfile -t SSH_PORTS < <(
+    if command -v sshd >/dev/null 2>&1; then
+        sshd -T 2>/dev/null | awk '/^port / {print $2}' | sort -nu
+    fi
+)
+if [[ ${#SSH_PORTS[@]} -eq 0 ]]; then
+    _p=$(systemctl show ssh.socket -p Listen 2>/dev/null | grep -oE ':[0-9]+' | tr -d ':' | head -n 1 || true)
+    [[ -z "$_p" ]] && _p=$(ss -tlnp 2>/dev/null | awk '/sshd|ssh\.socket/ {split($4,a,":"); print a[length(a)]; exit}' || true)
+    SSH_PORTS=("${_p:-22}")
 fi
-if [[ -z "$SSH_PORT" ]]; then
-    SSH_PORT=$(systemctl show ssh.socket -p Listen 2>/dev/null | grep -oE ':[0-9]+' | tr -d ':' | head -n 1 || true)
-fi
-if [[ -z "$SSH_PORT" ]]; then
-    SSH_PORT=$(ss -tlnp 2>/dev/null | awk '/sshd|ssh\.socket/ {split($4,a,":"); print a[length(a)]; exit}' || true)
-fi
-SSH_PORT=${SSH_PORT:-22}
+SSH_PORT="${SSH_PORTS[0]}"
+SSH_PORTS_CSV=$(IFS=,; echo "${SSH_PORTS[*]}")
 ACTIVE_SSH_PORT=$(awk '{print $4}' <<< "${SSH_CONNECTION:-}" 2>/dev/null || true)
 ADMIN_SSH_IP=$(awk '{print $1}' <<< "${SSH_CONNECTION:-}" 2>/dev/null || true)
 
+# Проверка доступности IPv6 в ядре (чтобы Nginx не падал на VPS с отключённым IPv6)
+HAS_IPV6=0
+if [[ -f /proc/net/if_inet6 ]] && [[ "$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null || echo 1)" != "1" ]]; then
+    HAS_IPV6=1
+fi
+
+# Предварительная проверка занятости портов 80/443 ДО перенаправления stdout в tee (интерактивный read безопасен)
+STOP_APACHE="N"
+PRE_BUSY_PORTS=$(ss -tlnp 2>/dev/null | grep -E ':(80|443)[[:space:]]' | grep -v 'nginx' || true)
+if [[ -n "$PRE_BUSY_PORTS" ]]; then
+    log_warn "Порты 80 или 443 сейчас заняты другим процессом:\n${PRE_BUSY_PORTS}"
+    if systemctl is-active --quiet apache2 2>/dev/null; then
+        if [[ "${NON_INTERACTIVE}" == "1" ]]; then
+            STOP_APACHE="Y"
+        else
+            read -erp "Обнаружен работающий apache2. Остановить и отключить его? [Y/n]: " STOP_APACHE
+            STOP_APACHE=${STOP_APACHE:-"Y"}
+        fi
+    else
+        if [[ "${NON_INTERACTIVE}" == "1" ]]; then
+            log_err "Порты 80/443 заняты другим процессом — автоматический выпуск SSL невозможен."
+        fi
+        read -erp "Certbot/Nginx не смогут занять порты 80/443. Всё равно продолжить? [y/N]: " PORT_CONT
+        [[ ! "$PORT_CONT" =~ ^[Yy]$ ]] && exit 1
+    fi
+fi
+
 echo -e "\n${YELLOW}Сводка параметров перед установкой:${NC}"
-echo "  • ОС:             Ubuntu 24.04 LTS"
+echo "  • ОС:             Ubuntu 24.04 LTS (IPv6: $([[ "$HAS_IPV6" -eq 1 ]] && echo 'включён' || echo 'отключён'))"
 echo "  • Домен:          ${DOMAIN}"
 echo "  • Инбаунды:       XHTTP («Мобилы» + «Домашний») + TCP Reality Self-Steal («Reality») [без клиентов]"
 echo "  • Роутинг Xray:   api->api + блокировка BitTorrent, Private IPs, Ads, Malware/Phishing"
+echo "  • Версия 3x-ui:   ${XUI_VERSION:-latest (master)}"
 echo "  • Маскировка:     ${MASK_LABEL}"
 echo "  • Порт панели:    127.0.0.1:${PANEL_PORT} (путь /${PANEL_PATH}/)"
 echo "  • Порт подписки:  127.0.0.1:${SUB_PORT} (путь /${SUB_PATH}/)"
 echo "  • Логин панели:   ${PANEL_USER}"
-echo "  • Безопасность:   UFW (SSH:${SSH_PORT}, 80, 443) + Fail2Ban + CrowdSec"
+echo "  • Безопасность:   UFW (SSH:${SSH_PORTS_CSV}, 80, 443) + Fail2Ban + CrowdSec"
 echo "  • Блок сканеров:  $([[ "$ENABLE_SCANNERS_BLOCK" =~ ^[Yy]$ ]] && echo 'C24Be + CyberOK Skipa (nftables)' || echo 'Отключено (доступно в my3xui)')"
 echo "  • Лог установки:  ${LOG_FILE}"
 echo "  • CLI-утилита:    my3xui (status, info, creds, crowdsec, blocklist, whitelist, backup, restore, inbounds, clean)"
@@ -418,8 +539,10 @@ if [[ "${AUTO_CONFIRM}" != "1" ]]; then
     [[ "$START_CONFIRM" =~ ^[Nn]$ ]] && exit 0
 fi
 
+exec 3>&1 4>&2
 LOG_STREAM_ACTIVE=1
 exec > >(tee -a "${LOG_FILE}") 2>&1
+TEE_PID=$!
 
 # 3. Установка базовых пакетов и официального Nginx
 log_info "Обновление пакетов и установка базовых утилит..."
@@ -429,6 +552,11 @@ apt-get install -y -qq curl wget gnupg2 ca-certificates lsb-release ubuntu-keyri
     sqlite3 python3 jq socat certbot ufw fail2ban nftables
 
 log_info "Подключение официального репозитория nginx.org (Ubuntu 24.04 noble)..."
+if dpkg-query -W -f='${Status}\n' nginx-common nginx-core nginx-full nginx-light 2>/dev/null | grep -q "install ok installed"; then
+    log_warn "Обнаружены пакеты Nginx из репозитория Ubuntu — удаляем их во избежание конфликта с nginx.org..."
+    systemctl stop nginx >/dev/null 2>&1 || true
+    apt-get remove -y -qq nginx-common nginx-core nginx-full nginx-light >/dev/null 2>&1 || true
+fi
 curl -fsSL https://nginx.org/keys/nginx_signing.key | gpg --dearmor -o /usr/share/keyrings/nginx-archive-keyring.gpg --yes
 echo "deb [signed-by=/usr/share/keyrings/nginx-archive-keyring.gpg] http://nginx.org/packages/ubuntu $(lsb_release -cs) nginx" > /etc/apt/sources.list.d/nginx.list
 printf "Package: *\nPin: origin nginx.org\nPin: release o=nginx\nPin-Priority: 900\n" > /etc/apt/preferences.d/99nginx
@@ -482,15 +610,24 @@ fs.inotify.max_user_instances = 8192
 fs.inotify.max_user_watches = 524288
 net.ipv4.tcp_notsent_lowat = 16384
 EOF
+RESERVED_PORTS="7443,8443,9443,11443,${PANEL_PORT},${SUB_PORT},62789"
+for _sp in "${SSH_PORTS[@]}"; do
+    if [[ "$_sp" -ge 1024 ]]; then
+        RESERVED_PORTS="${RESERVED_PORTS},${_sp}"
+    fi
+done
+echo "net.ipv4.ip_local_reserved_ports = ${RESERVED_PORTS}" >> /etc/sysctl.d/99-xray-custom.conf
 sysctl --system >/dev/null 2>&1 || log_warn "Часть параметров sysctl пропущена (ограничения виртуализации)."
 
 # 5. Настройка UFW
-log_info "Настройка файрвола UFW (SSH: ${SSH_PORT}, HTTP: 80, HTTPS: 443)..."
+log_info "Настройка файрвола UFW (SSH: ${SSH_PORTS_CSV}, HTTP: 80, HTTPS: 443)..."
 ufw --force reset >/dev/null
 ufw default deny incoming >/dev/null
 ufw default allow outgoing >/dev/null
-ufw allow "${SSH_PORT}/tcp" comment 'SSH' >/dev/null
-if [[ -n "$ACTIVE_SSH_PORT" && "$ACTIVE_SSH_PORT" != "$SSH_PORT" ]]; then
+for _sp in "${SSH_PORTS[@]}"; do
+    ufw allow "${_sp}/tcp" comment 'SSH' >/dev/null
+done
+if [[ -n "$ACTIVE_SSH_PORT" ]] && ! printf '%s\n' "${SSH_PORTS[@]}" | grep -qx "$ACTIVE_SSH_PORT"; then
     ufw allow "${ACTIVE_SSH_PORT}/tcp" comment 'SSH Active Session' >/dev/null
 fi
 ufw allow 80/tcp comment 'HTTP ACME' >/dev/null
@@ -501,26 +638,15 @@ log_ok "UFW активирован."
 # 6. Выпуск SSL-сертификата Let's Encrypt и настройка webroot для автопродления без остановки Nginx
 log_info "Получение SSL-сертификата для ${DOMAIN}..."
 systemctl stop nginx >/dev/null 2>&1 || true
+if [[ "${STOP_APACHE}" =~ ^[Yy]$ ]] && systemctl is-active --quiet apache2 2>/dev/null; then
+    systemctl disable --now apache2 >/dev/null 2>&1 || true
+    log_ok "apache2 остановлен и отключён."
+fi
 BUSY_PORTS=$(ss -tlnp 2>/dev/null | grep -E ':(80|443)[[:space:]]' || true)
 if [[ -n "$BUSY_PORTS" ]]; then
-    log_warn "Порты 80 или 443 заняты другим процессом:\n${BUSY_PORTS}"
-    if systemctl is-active --quiet apache2 2>/dev/null; then
-        if [[ "${NON_INTERACTIVE}" == "1" ]]; then
-            STOP_APACHE="Y"
-        else
-            read -erp "Обнаружен работающий apache2. Остановить и отключить его? [Y/n]: " STOP_APACHE
-            STOP_APACHE=${STOP_APACHE:-"Y"}
-        fi
-        if [[ "$STOP_APACHE" =~ ^[Yy]$ ]]; then
-            systemctl disable --now apache2 >/dev/null 2>&1 || true
-            log_ok "apache2 остановлен и отключён."
-        fi
-    else
-        if [[ "${NON_INTERACTIVE}" == "1" ]]; then
-            log_err "Порты 80/443 заняты другим процессом — автоматический выпуск SSL невозможен."
-        fi
-        read -erp "Certbot не сможет выпустить сертификат при занятом порте 80. Продолжить? [y/N]: " PORT_CONT
-        [[ ! "$PORT_CONT" =~ ^[Yy]$ ]] && exit 1
+    log_warn "Порты 80 или 443 всё ещё заняты:\n${BUSY_PORTS}"
+    if [[ ! -f "/etc/letsencrypt/live/${DOMAIN}/fullchain.pem" ]]; then
+        log_err "Освободите порты 80/443 перед выпуском сертификата Let's Encrypt и перезапустите скрипт."
     fi
 fi
 mkdir -p "/root/cert/${DOMAIN}" /var/www/html
@@ -1329,6 +1455,7 @@ EOF
     MASK_LOCATION_BLOCK=${MASK_LOCATION_BLOCK//@@SLUG@@/${COMPANY_SLUG}}
 else
     RP_HOST=$(echo "$REVERSE_PROXY_URL" | sed -E 's|^https?://||; s|/.*$||')
+    RP_SNI_HOST="${RP_HOST%%:*}"
     RP_SCHEME=$(echo "$REVERSE_PROXY_URL" | grep -oE '^https?' || echo "https")
     [[ -z "$RP_SCHEME" ]] && RP_SCHEME="https"
 
@@ -1341,7 +1468,7 @@ else
             set \$rp_upstream "${RP_SCHEME}://${RP_HOST}";
             proxy_pass \$rp_upstream;
             proxy_ssl_server_name on;
-            proxy_ssl_name ${RP_HOST};
+            proxy_ssl_name ${RP_SNI_HOST};
             proxy_http_version 1.1;
             proxy_ssl_session_reuse off;
             proxy_buffering on;
@@ -1375,15 +1502,31 @@ EOF
 chown -R www-data:www-data /var/cache/nginx /var/www /var/log/nginx
 
 # 8. Установка 3x-ui, загрузка расширенных баз geosite и патчинг /etc/x-ui/x-ui.db (без создания пользователей)
-log_info "Установка панели 3x-ui..."
-bash <(curl -Ls https://raw.githubusercontent.com/MHSanaei/3x-ui/master/install.sh) <<EOF
-n
-EOF
-systemctl stop x-ui
+log_info "Установка панели 3x-ui (${XUI_VERSION:-latest})..."
+XUI_INSTALLER_TMP=$(mktemp /tmp/3x-ui-install.XXXXXX.sh)
+XUI_INSTALLER_URL="https://raw.githubusercontent.com/MHSanaei/3x-ui/master/install.sh"
+if [[ -n "${XUI_VERSION}" ]]; then
+    XUI_INSTALLER_URL="https://raw.githubusercontent.com/MHSanaei/3x-ui/${XUI_VERSION}/install.sh"
+fi
+if ! curl -fsSL --retry 3 --retry-delay 2 --max-time 30 "${XUI_INSTALLER_URL}" -o "${XUI_INSTALLER_TMP}"; then
+    rm -f "${XUI_INSTALLER_TMP}"
+    log_err "Не удалось загрузить установщик 3x-ui (${XUI_INSTALLER_URL})."
+fi
+[[ -s "${XUI_INSTALLER_TMP}" ]] || { rm -f "${XUI_INSTALLER_TMP}"; log_err "Загруженный установщик 3x-ui пуст."; }
+if [[ -n "${XUI_VERSION}" ]]; then
+    printf "n\n" | bash "${XUI_INSTALLER_TMP}" "${XUI_VERSION}"
+else
+    printf "n\n" | bash "${XUI_INSTALLER_TMP}"
+fi
+rm -f "${XUI_INSTALLER_TMP}"
+
+[[ -x /usr/local/x-ui/x-ui ]] || log_err "Бинарный файл /usr/local/x-ui/x-ui не найден после установки."
+systemctl stop x-ui >/dev/null 2>&1 || true
+[[ -f /etc/x-ui/x-ui.db ]] || log_err "База данных /etc/x-ui/x-ui.db не создана установщиком 3x-ui."
 
 log_info "Загрузка баз geosite_IR.dat и geosite_RU.dat для фильтрации рекламы, фишинга и майнеров..."
-curl -fsSL "https://github.com/chocolate4u/Iran-v2ray-rules/releases/latest/download/geosite.dat" -o /usr/local/x-ui/bin/geosite_IR.dat || log_warn "Не удалось скачать geosite_IR.dat"
-curl -fsSL "https://github.com/runetfreedom/russia-v2ray-rules-dat/releases/latest/download/geosite.dat" -o /usr/local/x-ui/bin/geosite_RU.dat || log_warn "Не удалось скачать geosite_RU.dat"
+curl -fsSL --retry 2 --max-time 30 "https://github.com/chocolate4u/Iran-v2ray-rules/releases/latest/download/geosite.dat" -o /usr/local/x-ui/bin/geosite_IR.dat || log_warn "Не удалось скачать geosite_IR.dat"
+curl -fsSL --retry 2 --max-time 30 "https://github.com/runetfreedom/russia-v2ray-rules-dat/releases/latest/download/geosite.dat" -o /usr/local/x-ui/bin/geosite_RU.dat || log_warn "Не удалось скачать geosite_RU.dat"
 
 log_info "Определение геолокации IP сервера, настройка роутинга и создание чистых инбаундов в 3x-ui..."
 /usr/local/x-ui/x-ui setting -username "${PANEL_USER}" -password "${PANEL_PASS}" -port "${PANEL_PORT}" -webBasePath "/${PANEL_PATH}/" >/dev/null
@@ -1852,6 +1995,12 @@ rm -f /usr/local/x-ui/bin/config.json
 
 # 9. Формирование /etc/nginx/nginx.conf (HTTP/2 на 443 порту + корректное проксирование XHTTP + лог для Fail2Ban/CrowdSec)
 log_info "Генерация /etc/nginx/nginx.conf..."
+NGINX_LISTEN_80_V6=""
+NGINX_LISTEN_443_V6=""
+if [[ "${HAS_IPV6}" -eq 1 ]]; then
+    NGINX_LISTEN_80_V6="        listen [::]:80 default_server;"
+    NGINX_LISTEN_443_V6="        listen [::]:443 reuseport;"
+fi
 cat <<EOF > /etc/nginx/nginx.conf
 user www-data;
 worker_processes auto;
@@ -1955,20 +2104,20 @@ http {
     }
 
     map "\$badbot_raw:\$is_scan_attempt:\$request_uri" \$badbot {
-        ~^.*:/\.well-known/acme-challenge/ 0;
-        ~^.*:/robots\.txt(\?|\$) 0;
-        ~^.*:/\.well-known/security\.txt(\?|\$) 0;
-        ~^.*:/${PANEL_PATH}(/|\$) 0;
-        ~^.*:/${SUB_PATH}/ 0;
-        ~^.*:/${XHTTP_UP_PATH}/ 0;
-        ~^.*:/${XHTTP_ONE_PATH}/ 0;
-        ~(^1:|:1) 1;
+        ~^[01]:[01]:/\.well-known/acme-challenge/ 0;
+        ~^[01]:[01]:/robots\.txt(\?|\$) 0;
+        ~^[01]:[01]:/\.well-known/security\.txt(\?|\$) 0;
+        ~^[01]:[01]:/${PANEL_PATH}(/|\$) 0;
+        ~^[01]:[01]:/${SUB_PATH}/ 0;
+        ~^[01]:[01]:/${XHTTP_UP_PATH}/ 0;
+        ~^[01]:[01]:/${XHTTP_ONE_PATH}/ 0;
+        ~^(1:|0:1:) 1;
         default 0;
     }
 
     limit_req_zone \$limit_ip zone=bot:1m rate=4r/s;
     limit_req_zone \$limit_ip zone=panel:10m rate=30r/s;
-    limit_req_zone \$limit_ip zone=subs:1m rate=5r/m;
+    limit_req_zone \$limit_ip zone=subs:1m rate=15r/m;
     limit_req_zone \$limit_ip zone=scan:1m rate=1r/s;
     limit_req_zone \$limit_ip zone=fs_auth:10m rate=5r/m;
     limit_conn_zone \$limit_ip zone=addr:1m;
@@ -1984,7 +2133,7 @@ http {
 
     server {
         listen 80 default_server;
-        listen [::]:80 default_server;
+${NGINX_LISTEN_80_V6}
         server_name _;
         access_log off;
 
@@ -2053,6 +2202,7 @@ http {
             return 301 /${PANEL_PATH}/;
         }
         location ^~ /${PANEL_PATH}/ {
+            limit_req zone=panel burst=50 nodelay;
             proxy_pass https://panel_3xui/${PANEL_PATH}/;
             proxy_ssl_verify off;
             proxy_http_version 1.1;
@@ -2070,6 +2220,7 @@ http {
 
         # Сервис подписок 3x-ui
         location ^~ /${SUB_PATH}/ {
+            limit_req zone=subs burst=10 nodelay;
             proxy_pass https://127.0.0.1:${SUB_PORT}/${SUB_PATH}/;
             proxy_ssl_verify off;
             proxy_http_version 1.1;
@@ -2167,7 +2318,7 @@ stream {
 
     server {
         listen 443 reuseport;
-        listen [::]:443 reuseport;
+${NGINX_LISTEN_443_V6}
         ssl_preread on;
         preread_buffer_size 64k;
         proxy_protocol on;
@@ -2195,8 +2346,14 @@ sleep 2
 systemctl enable --now nginx
 systemctl restart x-ui nginx
 
-# Дополнительная привязка certbot к webroot после запуска Nginx
+# Дополнительная привязка certbot к webroot и проверка автопродления (dry-run)
 certbot reconfigure --cert-name "${DOMAIN}" --authenticator webroot --webroot-path /var/www/html --non-interactive >/dev/null 2>&1 || true
+log_info "Проверка автопродления SSL-сертификата (certbot renew --dry-run)..."
+if certbot renew --dry-run --cert-name "${DOMAIN}" >/dev/null 2>&1; then
+    log_ok "Автопродление SSL через webroot подтверждено (dry-run пройден)."
+else
+    log_warn "certbot renew --dry-run завершился с ошибкой. Проверьте вручную: certbot renew --dry-run"
+fi
 
 # 11. Настройка Fail2Ban (systemd для ssh.service + кастомный фильтр для сканеров Nginx)
 log_info "Настройка Fail2Ban..."
@@ -2224,9 +2381,9 @@ banaction = nftables-multiport
 
 [sshd]
 enabled = true
-port = ${SSH_PORT}
+port = ${SSH_PORTS_CSV}
 backend = systemd
-journalmatch = _SYSTEMD_UNIT=ssh.service
+journalmatch = _SYSTEMD_UNIT=ssh.service + _COMM=sshd
 
 [nginx-scanners]
 enabled = true
@@ -2253,59 +2410,85 @@ systemctl restart fail2ban
 
 # 12. Установка и настройка CrowdSec + nftables bouncer
 log_info "Установка CrowdSec и nftables firewall bouncer..."
-curl -s https://install.crowdsec.net | sh >/dev/null 2>&1 || log_warn "Репозиторий CrowdSec недоступен, используем пакеты Ubuntu 24.04..."
+CROWDSEC_OK=0
+if ! curl -fsSL --max-time 30 https://install.crowdsec.net | sh >/dev/null 2>&1; then
+    log_warn "Репозиторий CrowdSec недоступен — проверяем доступность пакетов в системных репозиториях..."
+fi
 safe_apt_update
-apt-get install -y -qq crowdsec crowdsec-firewall-bouncer-nftables
+if apt-cache show crowdsec >/dev/null 2>&1 && apt-cache show crowdsec-firewall-bouncer-nftables >/dev/null 2>&1; then
+    apt-get install -y -qq crowdsec crowdsec-firewall-bouncer-nftables
+    cscli hub update >/dev/null 2>&1 || true
+    cscli collections install crowdsecurity/linux crowdsecurity/sshd crowdsecurity/nginx --force >/dev/null 2>&1 || true
 
-cscli collections install crowdsecurity/linux crowdsecurity/sshd crowdsecurity/nginx --force >/dev/null 2>&1 || true
+    mkdir -p /etc/crowdsec/acquis.d
 
-mkdir -p /etc/crowdsec/acquis.d
-
-# Гарантируем, что CrowdSec читает логи Nginx без дублирования
-if grep -q "/var/log/nginx/access.log" /etc/crowdsec/acquis.yaml 2>/dev/null; then
-    rm -f /etc/crowdsec/acquis.d/nginx.yaml
-else
-    cat <<'EOF' > /etc/crowdsec/acquis.d/nginx.yaml
+    # Гарантируем, что CrowdSec читает логи Nginx без дублирования
+    if grep -q "/var/log/nginx/access.log" /etc/crowdsec/acquis.yaml 2>/dev/null; then
+        rm -f /etc/crowdsec/acquis.d/nginx.yaml
+    else
+        cat <<'EOF' > /etc/crowdsec/acquis.d/nginx.yaml
 filenames:
   - /var/log/nginx/access.log
   - /var/log/nginx/error.log
 labels:
   type: nginx
 EOF
-fi
+    fi
 
-# Гарантируем чтение логов sshd из systemd journal на Ubuntu 24.04 (если нет /var/log/auth.log)
-if [[ ! -f /var/log/auth.log ]] && ! grep -rq "_SYSTEMD_UNIT=ssh.service" /etc/crowdsec/acquis* 2>/dev/null; then
-    cat <<'EOF' > /etc/crowdsec/acquis.d/sshd-journal.yaml
+    # Гарантируем чтение логов sshd из systemd journal на Ubuntu 24.04 (покрывает и ssh.service, и ssh@*.service)
+    if [[ ! -f /var/log/auth.log ]] && ! grep -rqE "_SYSTEMD_UNIT=ssh\.service|SYSLOG_IDENTIFIER=sshd" /etc/crowdsec/acquis* 2>/dev/null; then
+        cat <<'EOF' > /etc/crowdsec/acquis.d/sshd-journal.yaml
 source: journalctl
 journalctl_filter:
-  - "_SYSTEMD_UNIT=ssh.service"
+  - "SYSLOG_IDENTIFIER=sshd"
 labels:
   type: syslog
 EOF
-fi
-
-# Запускаем CrowdSec LAPI до регистрации баунсера, чтобы избежать гонки запуска
-systemctl enable --now crowdsec
-for _ in $(seq 1 10); do
-    cscli bouncers list >/dev/null 2>&1 && break
-    sleep 1
-done
-
-# Удаляем автосозданные и старые firewall-баунсеры, чтобы не оставлять дубликаты
-for OLD_B in $(cscli bouncers list -o json 2>/dev/null | jq -r '.[].name // empty' 2>/dev/null || true); do
-    if [[ "$OLD_B" == "firewall-bouncer" || "$OLD_B" == cs-firewall-bouncer* ]]; then
-        cscli bouncers delete "$OLD_B" >/dev/null 2>&1 || true
     fi
-done
 
-BOUNCER_KEY=$(cscli bouncers add firewall-bouncer -o raw)
-rm -f /etc/crowdsec/bouncers/crowdsec-firewall-bouncer.yaml.local
-sed -i "s|^api_key:.*|api_key: ${BOUNCER_KEY}|" /etc/crowdsec/bouncers/crowdsec-firewall-bouncer.yaml
-sed -i "s|^mode:.*|mode: nftables|" /etc/crowdsec/bouncers/crowdsec-firewall-bouncer.yaml
+    # Запускаем CrowdSec LAPI до регистрации баунсера (ждём до 30с для слабых VPS)
+    systemctl enable --now crowdsec
+    LAPI_READY=0
+    for _ in $(seq 1 30); do
+        if cscli bouncers list >/dev/null 2>&1; then
+            LAPI_READY=1
+            break
+        fi
+        sleep 1
+    done
 
-systemctl enable --now crowdsec-firewall-bouncer
-systemctl restart crowdsec crowdsec-firewall-bouncer
+    if [[ "${LAPI_READY}" -eq 1 ]]; then
+        # Удаляем автосозданные и старые firewall-баунсеры, чтобы не оставлять дубликаты
+        for OLD_B in $(cscli bouncers list -o json 2>/dev/null | jq -r '.[].name // empty' 2>/dev/null || true); do
+            if [[ "$OLD_B" == "firewall-bouncer" || "$OLD_B" == cs-firewall-bouncer* ]]; then
+                cscli bouncers delete "$OLD_B" >/dev/null 2>&1 || true
+            fi
+        done
+
+        BOUNCER_KEY=$(cscli bouncers add firewall-bouncer -o raw 2>/dev/null | tr -d '[:space:]' || true)
+        if [[ -n "${BOUNCER_KEY}" && -f /etc/crowdsec/bouncers/crowdsec-firewall-bouncer.yaml ]]; then
+            rm -f /etc/crowdsec/bouncers/crowdsec-firewall-bouncer.yaml.local
+            sed -i "s|^api_key:.*|api_key: ${BOUNCER_KEY}|" /etc/crowdsec/bouncers/crowdsec-firewall-bouncer.yaml
+            sed -i "s|^mode:.*|mode: nftables|" /etc/crowdsec/bouncers/crowdsec-firewall-bouncer.yaml
+
+            systemctl enable --now crowdsec-firewall-bouncer >/dev/null 2>&1 || true
+            systemctl restart crowdsec crowdsec-firewall-bouncer >/dev/null 2>&1 || true
+            sleep 2
+            if systemctl is-active --quiet crowdsec && systemctl is-active --quiet crowdsec-firewall-bouncer; then
+                CROWDSEC_OK=1
+                log_ok "CrowdSec и nftables firewall bouncer активны и зарегистрированы."
+            else
+                log_warn "CrowdSec или crowdsec-firewall-bouncer не запустились — проверьте: systemctl status crowdsec crowdsec-firewall-bouncer"
+            fi
+        else
+            log_warn "Не удалось зарегистрировать ключ firewall-bouncer для CrowdSec."
+        fi
+    else
+        log_warn "CrowdSec LAPI не ответил за 30 секунд — регистрация bouncer пропущена."
+    fi
+else
+    log_warn "Пакет crowdsec-firewall-bouncer-nftables недоступен (репозиторий CrowdSec недоступен). Пропускаем установку CrowdSec."
+fi
 
 # 13. Подготовка генератора объединённой блокировки C24Be + CyberOK Skipa в nftables (с защитой SSH и белым списком IP)
 log_info "Подготовка модуля блокировки сканеров (C24Be AS_Network_List + CyberOK Skipa)..."
@@ -2320,14 +2503,59 @@ cat <<EOF > /usr/local/sbin/update-scanners-blocklist.sh
 #!/usr/bin/env python3
 import os
 import re
+import sys
 import ipaddress
 import urllib.request
 import subprocess
 
 NFT_FILE = "/etc/nftables.d/scanners_block.nft"
+NFT_TMP = "/etc/nftables.d/scanners_block.nft.tmp"
 WL_FILE = "/etc/nftables.d/whitelist_ips.txt"
-SSH_PORT = ${SSH_PORT}
+SSH_PORTS_CSV = "${SSH_PORTS_CSV}"
 os.makedirs("/etc/nftables.d", exist_ok=True)
+
+def load_whitelist_rule():
+    wl_ips = set()
+    if os.path.exists(WL_FILE):
+        with open(WL_FILE, "r", encoding="utf-8") as wf:
+            for line in wf:
+                line = line.split("#", 1)[0].strip()
+                try:
+                    ip = ipaddress.ip_address(line)
+                    if ip.version == 4:
+                        wl_ips.add(str(ip))
+                except ValueError:
+                    pass
+    if wl_ips:
+        wl_elems = ", ".join(sorted(wl_ips))
+        return f"        ip saddr {{ {wl_elems} }} accept\\n"
+    return ""
+
+def validate_and_apply(nft_text):
+    with open(NFT_TMP, "w", encoding="utf-8") as f:
+        f.write(nft_text)
+    subprocess.run(["/usr/sbin/nft", "-c", "-f", NFT_TMP], check=True)
+    os.replace(NFT_TMP, NFT_FILE)
+    subprocess.run(["/usr/sbin/nft", "-f", NFT_FILE], check=True)
+
+ssh_ports = [p.strip() for p in SSH_PORTS_CSV.split(",") if p.strip().isdigit()]
+ssh_dport_expr = f"{{ {', '.join(ssh_ports)} }}" if len(ssh_ports) > 1 else (ssh_ports[0] if ssh_ports else "22")
+
+# Режим локального переприменения белого списка без повторной загрузки с GitHub
+if "--reload-whitelist" in sys.argv:
+    if not os.path.exists(NFT_FILE):
+        raise SystemExit("Error: existing scanners_block.nft not found; run full update first.")
+    with open(NFT_FILE, "r", encoding="utf-8") as f:
+        existing = f.read()
+    wl_rule = load_whitelist_rule()
+    updated = re.sub(r"^\\s*ip saddr \\{[^}]*\\} accept\\n?", "", existing, flags=re.M)
+    marker = "        ip saddr @scanners_v4 counter drop"
+    if marker not in updated:
+        raise SystemExit("Error: unexpected scanners_block.nft format.")
+    updated = updated.replace(marker, f"{wl_rule}{marker}", 1)
+    validate_and_apply(updated)
+    print("OK: Whitelist reapplied to nftables without remote download.")
+    raise SystemExit(0)
 
 sources = {
     "C24Be_AS_Network_List": [
@@ -2374,23 +2602,7 @@ if len(valid_nets) < 100:
 
 collapsed = list(ipaddress.collapse_addresses(sorted(valid_nets)))
 elements = ",\\n        ".join(str(net) for net in collapsed)
-
-wl_ips = set()
-if os.path.exists(WL_FILE):
-    with open(WL_FILE, "r", encoding="utf-8") as wf:
-        for line in wf:
-            line = line.split("#", 1)[0].strip()
-            try:
-                ip = ipaddress.ip_address(line)
-                if ip.version == 4:
-                    wl_ips.add(str(ip))
-            except ValueError:
-                pass
-
-wl_rule = ""
-if wl_ips:
-    wl_elems = ", ".join(sorted(wl_ips))
-    wl_rule = f"        ip saddr {{ {wl_elems} }} accept\\n"
+wl_rule = load_whitelist_rule()
 
 nft_config = f"""# Sources: C24Be={stats.get('C24Be_AS_Network_List', 0)}, CyberOK={stats.get('CyberOK_Skipa_ips', 0)}, Collapsed={len(collapsed)}
 table inet scanners_block
@@ -2408,16 +2620,13 @@ table inet scanners_block {{
     chain prerouting {{
         type filter hook prerouting priority -150; policy accept;
         ct state established,related accept
-        tcp dport {SSH_PORT} accept
+        tcp dport {ssh_dport_expr} accept
 {wl_rule}        ip saddr @scanners_v4 counter drop
     }}
 }}
 """
 
-with open(NFT_FILE, "w", encoding="utf-8") as f:
-    f.write(nft_config)
-
-subprocess.run(["/usr/sbin/nft", "-f", NFT_FILE], check=True)
+validate_and_apply(nft_config)
 print(f"OK: Loaded {len(collapsed)} collapsed IPv4 CIDRs (C24Be: {stats.get('C24Be_AS_Network_List', 0)}, CyberOK: {stats.get('CyberOK_Skipa_ips', 0)})")
 EOF
 chmod +x /usr/local/sbin/update-scanners-blocklist.sh
@@ -2476,7 +2685,7 @@ show_status() {
     for svc in x-ui nginx fail2ban crowdsec crowdsec-firewall-bouncer scanners-blocklist; do
         if systemctl is-active --quiet "$svc" 2>/dev/null; then
             printf "  • %-28s ${GREEN}active${NC}\n" "${svc}:"
-        elif systemctl list-unit-files "${svc}.service" >/dev/null 2>&1; then
+        elif systemctl cat "${svc}.service" >/dev/null 2>&1; then
             printf "  • %-28s ${YELLOW}inactive${NC}\n" "${svc}:"
         else
             printf "  • %-28s ${RED}not installed${NC}\n" "${svc}:"
@@ -2645,7 +2854,7 @@ manage_whitelist() {
             ;;
         add)
             [[ -z "$target_ip" ]] && read -erp "Введите IPv4 для добавления в белый список: " target_ip
-            if ! [[ "$target_ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+            if ! python3 -c 'import ipaddress, sys; ipaddress.IPv4Address(sys.argv[1])' "$target_ip" 2>/dev/null; then
                 echo -e "${RED}Некорректный IPv4-адрес.${NC}"
                 return 1
             fi
@@ -2653,7 +2862,10 @@ manage_whitelist() {
             sort -u "$wl_file" -o "$wl_file"
             sync_f2b_whitelist
             if /usr/sbin/nft list table inet scanners_block &>/dev/null; then
-                /usr/local/sbin/update-scanners-blocklist.sh >/dev/null 2>&1 || true
+                if ! /usr/local/sbin/update-scanners-blocklist.sh --reload-whitelist >/dev/null 2>&1; then
+                    echo -e "${YELLOW}[WARN] IP добавлен в файл и Fail2Ban, но обновить nftables не удалось.${NC}"
+                    return 1
+                fi
             fi
             echo -e "${GREEN}[OK] IP ${target_ip} добавлен в белый список (nftables + Fail2Ban).${NC}"
             ;;
@@ -2663,7 +2875,10 @@ manage_whitelist() {
             mv "${wl_file}.tmp" "$wl_file"
             sync_f2b_whitelist
             if /usr/sbin/nft list table inet scanners_block &>/dev/null; then
-                /usr/local/sbin/update-scanners-blocklist.sh >/dev/null 2>&1 || true
+                if ! /usr/local/sbin/update-scanners-blocklist.sh --reload-whitelist >/dev/null 2>&1; then
+                    echo -e "${YELLOW}[WARN] IP удалён из файла и Fail2Ban, но обновить nftables не удалось.${NC}"
+                    return 1
+                fi
             fi
             echo -e "${GREEN}[OK] IP ${target_ip} удалён из белого списка.${NC}"
             ;;
@@ -2697,18 +2912,40 @@ create_backup() {
     local ts
     ts=$(date +%Y%m%d-%H%M%S)
     local archive="${bdir}/my3xui-backup-${ts}.tar.gz"
+    local tmp_dir
+    tmp_dir=$(mktemp -d /tmp/my3xui-backup.XXXXXX)
     mkdir -p "$bdir"
-    local files=()
-    for f in /etc/x-ui/x-ui.db /etc/nginx/nginx.conf /etc/fail2ban/jail.local /etc/nftables.d/whitelist_ips.txt /root/vps-credentials.txt; do
-        [[ -f "$f" ]] && files+=("$f")
+    local rel_files=()
+
+    if [[ -f /etc/x-ui/x-ui.db ]]; then
+        mkdir -p "${tmp_dir}/etc/x-ui"
+        if command -v sqlite3 >/dev/null 2>&1; then
+            sqlite3 /etc/x-ui/x-ui.db ".timeout 5000" ".backup '${tmp_dir}/etc/x-ui/x-ui.db'"
+        else
+            python3 -c 'import sqlite3, sys; s=sqlite3.connect(sys.argv[1]); d=sqlite3.connect(sys.argv[2]); s.backup(d); d.close(); s.close()' \
+                /etc/x-ui/x-ui.db "${tmp_dir}/etc/x-ui/x-ui.db"
+        fi
+        rel_files+=("etc/x-ui/x-ui.db")
+    fi
+
+    for f in /etc/nginx/nginx.conf /etc/fail2ban/jail.local /etc/nftables.d/whitelist_ips.txt /root/vps-credentials.txt; do
+        if [[ -f "$f" ]]; then
+            local rel="${f#/}"
+            mkdir -p "${tmp_dir}/$(dirname "$rel")"
+            cp -a "$f" "${tmp_dir}/${rel}"
+            rel_files+=("$rel")
+        fi
     done
-    if [[ ${#files[@]} -eq 0 ]]; then
+
+    if [[ ${#rel_files[@]} -eq 0 ]]; then
+        rm -rf "$tmp_dir"
         echo -e "${YELLOW}Файлы для резервного копирования не найдены.${NC}"
         return 1
     fi
-    tar -czf "$archive" "${files[@]}" 2>/dev/null
+    tar -czf "$archive" -C "$tmp_dir" "${rel_files[@]}"
+    rm -rf "$tmp_dir"
     chmod 600 "$archive"
-    echo -e "${GREEN}[OK] Бэкап создан: ${archive}${NC}"
+    echo -e "${GREEN}[OK] Консистентный бэкап создан: ${archive}${NC}"
 }
 
 restore_backup() {
@@ -3214,13 +3451,21 @@ manage_inbounds() {
 }
 
 clean_server() {
+    export DEBIAN_FRONTEND=noninteractive
+    export NEEDRESTART_MODE=a
     echo -e "\n${RED}${BOLD}ВНИМАНИЕ! ПОЛНАЯ ОЧИСТКА СЕРВЕРА!${NC}"
     echo "Будут полностью удалены: 3x-ui, Xray, Nginx, CrowdSec, Fail2Ban, симлинки /root/cert,"
-    echo "веб-заглушка, sysctl-тюнинг, правила nftables/UFW, cron-задачи и команда my3xui."
-    echo "(Сертификаты в /etc/letsencrypt по умолчанию сохраняются, чтобы не упереться в лимиты LE.)"
+    echo "веб-заглушка, sysctl-тюнинг, правила nftables, cron-задачи и команда my3xui."
+    echo "(Сертификаты в /etc/letsencrypt и порт SSH по умолчанию сохраняются ради безопасности.)"
     read -erp "Вы уверены? Введите YES для подтверждения: " CONFIRM1
     [[ "$CONFIRM1" != "YES" ]] && { echo "Отменено."; return; }
     read -erp "Удалить также сертификаты Let's Encrypt (/etc/letsencrypt)? [y/N]: " DEL_LE
+    read -erp "Отключить и сбросить все правила UFW? [Y/n]: " RESET_UFW
+    RESET_UFW=${RESET_UFW:-Y}
+    local REVERT_SSH="N"
+    if [[ -f /etc/ssh/sshd_config.d/99-custom-port.conf || -f /etc/my3xui-ssh-state ]]; then
+        read -erp "Откатить изменения SSH (99-custom-port.conf / ssh.socket)? ВНИМАНИЕ: порт SSH может измениться! [y/N]: " REVERT_SSH
+    fi
 
     echo -e "${YELLOW}[1/6] Остановка и удаление 3x-ui...${NC}"
     systemctl stop x-ui 2>/dev/null || true
@@ -3243,24 +3488,48 @@ clean_server() {
     apt-get purge -y -qq crowdsec crowdsec-firewall-bouncer-nftables fail2ban >/dev/null 2>&1 || true
     rm -rf /etc/crowdsec /var/lib/crowdsec /etc/fail2ban /etc/apt/sources.list.d/crowdsec*
 
-    echo -e "${YELLOW}[4/6] Очистка правил nftables и отключение UFW...${NC}"
+    echo -e "${YELLOW}[4/6] Очистка правил nftables и UFW...${NC}"
     systemctl stop scanners-blocklist.service skipa-blocklist.service 2>/dev/null || true
     systemctl disable scanners-blocklist.service skipa-blocklist.service 2>/dev/null || true
     /usr/sbin/nft delete table inet scanners_block 2>/dev/null || true
     /usr/sbin/nft delete table inet skipa_block 2>/dev/null || true
-    rm -f /etc/nftables.d/scanners_block.nft /etc/nftables.d/whitelist_ips.txt \
+    rm -f /etc/nftables.d/scanners_block.nft /etc/nftables.d/scanners_block.nft.tmp /etc/nftables.d/whitelist_ips.txt \
           /usr/local/sbin/update-scanners-blocklist.sh \
           /etc/systemd/system/scanners-blocklist.service /etc/cron.d/scanners-blocklist \
           /etc/nftables.d/skipa_block.nft /usr/local/sbin/update-skipa-blocklist.sh \
           /etc/systemd/system/skipa-blocklist.service /etc/cron.d/skipa-blocklist
-    ufw --force disable >/dev/null 2>&1 || true
-    ufw --force reset >/dev/null 2>&1 || true
+    if [[ "${RESET_UFW}" =~ ^[Yy]$ ]]; then
+        ufw --force disable >/dev/null 2>&1 || true
+        ufw --force reset >/dev/null 2>&1 || true
+    fi
 
-    echo -e "${YELLOW}[5/6] Удаление сертификатов, sysctl-тюнинга и логов установки...${NC}"
+    echo -e "${YELLOW}[5/6] Удаление сертификатов, sysctl-тюнинга, состояния SSH и логов...${NC}"
     rm -rf /root/cert /etc/letsencrypt/renewal-hooks/deploy/reload-services.sh \
            /etc/sysctl.d/99-xray-custom.conf /root/vps-credentials.txt /var/log/my3xui-install.log
     if [[ "${DEL_LE:-}" =~ ^[Yy]$ ]]; then
         rm -rf /etc/letsencrypt
+    fi
+    if [[ "${REVERT_SSH:-}" =~ ^[Yy]$ ]]; then
+        local sock_was_enabled=0
+        if [[ -f /etc/my3xui-ssh-state ]]; then
+            source /etc/my3xui-ssh-state || true
+            sock_was_enabled="${SSH_SOCKET_WAS_ENABLED:-0}"
+        fi
+        rm -f /etc/ssh/sshd_config.d/99-custom-port.conf
+        [[ -f /etc/ssh/sshd_config.my3xui.bak ]] && mv -f /etc/ssh/sshd_config.my3xui.bak /etc/ssh/sshd_config
+        local bak
+        for bak in /etc/ssh/sshd_config.d/*.conf.my3xui.bak; do
+            [[ -f "$bak" ]] && mv -f "$bak" "${bak%.my3xui.bak}"
+        done
+        if sshd -t 2>/dev/null; then
+            if [[ "${sock_was_enabled}" == "1" ]]; then
+                systemctl disable --now ssh.service >/dev/null 2>&1 || true
+                systemctl enable --now ssh.socket >/dev/null 2>&1 || true
+            else
+                systemctl restart ssh.service >/dev/null 2>&1 || true
+            fi
+        fi
+        rm -f /etc/my3xui-ssh-state
     fi
     sysctl --system >/dev/null 2>&1 || true
     apt-get autoremove -y -qq >/dev/null 2>&1 || true
@@ -3333,9 +3602,9 @@ echo -e "  • ОС:            Ubuntu 24.04 LTS"
 echo -e "  • Инбаунды:      XHTTP Packet-UP («Мобилы») + XHTTP Stream-One («Домашний») + TCP Reality («Reality»)"
 echo -e "  • Пользователи:  не создавались (добавьте их в веб-панели 3x-ui)"
 echo -e "  • Роутинг Xray:  api->api + блокировка BitTorrent, Private IPs, Ads, Malware/Phishing"
-echo -e "  • UFW:           активен (открыты только SSH:${SSH_PORT}, 80, 443)"
+echo -e "  • UFW:           активен (открыты только SSH:${SSH_PORTS_CSV}, 80, 443)"
 echo -e "  • Fail2Ban:      активен (sshd + nginx-scanners + myfakesite-auth через nftables)"
-echo -e "  • CrowdSec:      активен (crowdsec + nftables firewall bouncer)"
+echo -e "  • CrowdSec:      $([[ "${CROWDSEC_OK:-0}" -eq 1 ]] && echo 'активен (crowdsec + nftables firewall bouncer)' || echo 'требует внимания / не установлен (см. лог)')"
 echo -e "  • Блок сканеров: $([[ "$ENABLE_SCANNERS_BLOCK" =~ ^[Yy]$ ]] && echo 'C24Be + CyberOK Skipa (nftables prerouting drop)' || echo 'отключен (my3xui blocklist install)')"
 echo -e "  • Лог установки: ${LOG_FILE}"
 echo -e "  • CLI-утилита:   my3xui (status | info | creds | crowdsec | blocklist | whitelist | backup | restore | inbounds | clean)"
