@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # ============================================================================
-# Установщик 3x-ui 3.11+ + Nginx HTTP/2 XHTTP + Security Stack (v4)
+# Установщик 3x-ui 3.11+ + Nginx HTTP/2 XHTTP + Security Stack (v5)
 # Инбаунды: XHTTP Packet-UP ("Мобилы") + Stream-One ("Домашний") + TCP Reality Self-Steal ("Reality") без клиентов
 # Маршрутизация: api->api, блокировка BitTorrent, Private IPs, Ads, Malware
 # Поддержка: Ubuntu 24.04 LTS | Маска: CloudDisk (mock API) / VAPEN Cloud Storage (S3) / Reverse Proxy
@@ -10,7 +10,7 @@ set -euo pipefail
 #
 # Неинтерактивный запуск (пример):
 #   NON_INTERACTIVE=1 DOMAIN=node.example.com MASK_MODE=vapen COMPANY_NAME="VAPEN" \
-#   ENABLE_SCANNERS_BLOCK=Y SKIP_UPGRADE=1 bash install-vps-v4.sh
+#   ENABLE_SCANNERS_BLOCK=Y SKIP_UPGRADE=1 bash install-vps-v5.sh
 # Доступные переменные окружения:
 #   NON_INTERACTIVE=1, AUTO_CONFIRM=1, SKIP_UPGRADE=1, AUTO_UPGRADE=1,
 #   IGNORE_DNS_CHECK=1, SSH_NEW_PORT=2222, DOMAIN, LE_EMAIL, MASK_MODE (disk|vapen|proxy),
@@ -44,7 +44,7 @@ log_err()   { echo -e "${RED}[ERROR]${NC} $1";  _log_file_write "[ERROR] $1"; ex
 [[ $EUID -ne 0 ]] && log_err "Запустите скрипт от имени root (sudo bash $0)."
 
 touch "${LOG_FILE}" && chmod 600 "${LOG_FILE}"
-_log_file_write "=== Запуск установщика 3x-ui v4 ==="
+_log_file_write "=== Запуск установщика 3x-ui v5 ==="
 
 if [[ -f /etc/os-release ]]; then
     . /etc/os-release
@@ -1509,6 +1509,8 @@ bin_dir = "/usr/local/x-ui/bin"
 conn = sqlite3.connect(db_path)
 cur = conn.cursor()
 
+per_app_list = "org.telegram.messenger, com.whatsapp, com.instagram.android, com.google.android.youtube, com.twitter.android, com.facebook.katana, com.google.android.apps.youtube.music, com.spotify.music, com.netflix.mediaclient"
+
 settings_map = {
     "webPort": panel_port,
     "webListen": "127.0.0.1",
@@ -1522,7 +1524,44 @@ settings_map = {
     "subCertFile": f"/root/cert/{domain}/fullchain.pem",
     "subKeyFile": f"/root/cert/{domain}/privkey.pem",
     "subURI": f"https://{domain}/{sub_path}/",
-    "twoFactorEnable": "false"
+    "twoFactorEnable": "false",
+
+    # Общие настройки подписки
+    "subUpdates": "12",
+    "subHideSettings": "true",
+    "subHostSortMode": "inbound-first",
+    "subProfileMode": "none",
+    "subInfoNodeEnable": "false",
+    "subShowIdentityOnAllLinks": "false",
+    "subCalendarExpireInclusive": "false",
+    "subExpiredTemplate": "⛔ {{EMAIL}} | Expired: {{EXPIRE_DATE}}",
+    "subTrafficDepletedTemplate": "🚫 {{EMAIL}} | Traffic Depleted | {{TRAFFIC_USED}}/{{TRAFFIC_TOTAL}}",
+
+    # Вкладка HAPP
+    "happLinkEnable": "true",
+    "subEnableRouting": "true",
+    "subHappAutoDetect": "true",
+    "subHappAlwaysHwid": "false",
+    "subHappAutoConnect": "false",
+    "subHappAutoConnectType": "lowestdelay",
+    "subHappExcludeApns": "true",
+    "subHappNoLimit": "false",
+    "subHappNotificationExpire": "true",
+    "subHappSubExpire": "true",
+    "subHappSubInfoColor": "blue",
+    "subHappPerAppMode": "on",
+    "subHappPerAppList": per_app_list,
+    "subRoutingRules": "happ://routing/onadd/eyJOYW1lIjoiUm9zY29tVlBOIiwiR2xvYmFsUHJveHkiOiJ0cnVlIiwiVXNlQ2h1bmtGaWxlcyI6InRydWUiLCJSZW1vdGVEbnMiOiI4LjguOC44IiwiRG9tZXN0aWNEbnMiOiI3Ny44OC44LjgiLCJSZW1vdGVETlNUeXBlIjoiRG9IIiwiUmVtb3RlRE5TRG9tYWluIjoiaHR0cHM6Ly84LjguOC44L2Rucy1xdWVyeSIsIlJlbW90ZUROU0lQIjoiOC44LjguOCIsIkRvbWVzdGljRE5TVHlwZSI6IkRvSCIsIkRvbWVzdGljRE5TRG9tYWluIjoiaHR0cHM6Ly83Ny44OC44LjgvZG5zLXF1ZXJ5IiwiRG9tZXN0aWNETlNJUCI6Ijc3Ljg4LjguOCIsIkdlb2lwdXJsIjoiaHR0cHM6Ly9jZG4uanNkZWxpdnIubmV0L2doL2h5ZHJhcG9uaXF1ZS9yb3Njb212cG4tZ2VvaXBAMjAyNjExMTcxMTQ1L3JlbGVhc2UvZ2VvaXAuZGF0IiwiR2Vvc2l0ZXVybCI6Imh0dHBzOi8vY2RuLmpzZGVsaXZyLm5ldC9naC9oeWRyYXBvbmlxdWUvcm9zY29tdnBuLWdlb3NpdGVAMjAyNjEwMTIwOTQ4L3JlbGVhc2UvZ2Vvc2l0ZS5kYXQiLCJMYXN0VXBkYXRlZCI6IjE3OTQ5MTU5NjkiLCJEbnNIb3N0cyI6eyJsa2ZsMi5uYWxvZy5ydSI6IjIxMy4yNC42NC4xNzUiLCJsa25wZC5uYWxvZy5ydSI6IjIxMy4yNC42NC4xODEifSwiUm91dGVPcmRlciI6ImJsb2NrLXByb3h5LWRpcmVjdCIsIkRpcmVjdFNpdGVzIjpbImdlb3NpdGU6cHJpdmF0ZSIsImdlb3NpdGU6Y2F0ZWdvcnktcnUiLCJnZW9zaXRlOndoaXRlbGlzdCIsImdlb3NpdGU6bWljcm9zb2Z0IiwiZ2Vvc2l0ZTphcHBsZSIsImdlb3NpdGU6ZXBpY2dhbWVzIiwiZ2Vvc2l0ZTpyaW90IiwiZ2Vvc2l0ZTplc2NhcGVmcm9tdGFya292IiwiZ2Vvc2l0ZTpzdGVhbSIsImdlb3NpdGU6dHdpdGNoIiwiZ2Vvc2l0ZTpwaW50ZXJlc3QiLCJnZW9zaXRlOmZhY2VpdCJdLCJEaXJlY3RJcCI6WyJnZW9pcDpwcml2YXRlIiwiZ2VvaXA6ZGlyZWN0Il0sIlByb3h5U2l0ZXMiOlsiZ2Vvc2l0ZTpnb29nbGUtcGxheSIsImdlb3NpdGU6Z2l0aHViIiwiZ2Vvc2l0ZTp0d2l0Y2gtYWRzIiwiZ2Vvc2l0ZTp5b3V0dWJlIiwiZ2Vvc2l0ZTp0ZWxlZ3JhbSJdLCJQcm94eUlwIjpbXSwiQmxvY2tTaXRlcyI6WyJnZW9zaXRlOndpbi1zcHkiLCJnZW9zaXRlOnRvcnJlbnQiLCJnZW9zaXRlOmNhdGVnb3J5LWFkcyJdLCJCbG9ja0lwIjpbXSwiRG9tYWluU3RyYXRlZ3kiOiJJUElmTm9uTWF0Y2giLCJGYWtlRE5TIjoiZmFsc2UifQo=",
+
+    # Вкладка INCY
+    "subIncyAppAutoDetect": "true",
+    "subIncyEnableRouting": "true",
+    "subIncyHideUrl": "1",
+    "subIncyNoLimitEnabled": "1",
+    "subIncyPerAppEnable": "1",
+    "subIncyPerAppMode": "proxy",
+    "subIncyPerAppList": per_app_list,
+    "subIncyRoutingRules": "incy://routing/onadd/eyJOYW1lIjoiUm9zY29tVlBOIiwiR2xvYmFsUHJveHkiOiJ0cnVlIiwiVXNlQ2h1bmtGaWxlcyI6InRydWUiLCJSZW1vdGVEbnMiOiI4LjguOC44IiwiRG9tZXN0aWNEbnMiOiI3Ny44OC44LjgiLCJSZW1vdGVETlNUeXBlIjoiRG9IIiwiUmVtb3RlRE5TRG9tYWluIjoiaHR0cHM6Ly84LjguOC44L2Rucy1xdWVyeSIsIlJlbW90ZUROU0lQIjoiOC44LjguOCIsIkRvbWVzdGljRE5TVHlwZSI6IkRvSCIsIkRvbWVzdGljRE5TRG9tYWluIjoiaHR0cHM6Ly83Ny44OC44LjgvZG5zLXF1ZXJ5IiwiRG9tZXN0aWNETlNJUCI6Ijc3Ljg4LjguOCIsIkdlb2lwdXJsIjoiaHR0cHM6Ly9jZG4uanNkZWxpdnIubmV0L2doL2h5ZHJhcG9uaXF1ZS9yb3Njb212cG4tZ2VvaXAvcmVsZWFzZS9nZW9pcC5kYXQiLCJHZW9zaXRldXJsIjoiaHR0cHM6Ly9jZG4uanNkZWxpdnIubmV0L2doL2h5ZHJhcG9uaXF1ZS9yb3Njb212cG4tZ2Vvc2l0ZS9yZWxlYXNlL2dlb3NpdGUuZGF0IiwiTGFzdFVwZGF0ZWQiOiIxNzk0OTE1OTcwIiwiRG5zSG9zdHMiOnsibGtmbDIubmFsb2cucnUiOiIyMTMuMjQuNjQuMTc1IiwibGtucGQubmFsb2cucnUiOiIyMTMuMjQuNjQuMTgxIn0sIlJvdXRlT3JkZXIiOiJibG9jay1wcm94eS1kaXJlY3QiLCJEaXJlY3RTaXRlcyI6WyJnZW9zaXRlOnByaXZhdGUiLCJnZW9zaXRlOmNhdGVnb3J5LXJ1IiwiZ2Vvc2l0ZTp3aGl0ZWxpc3QiLCJnZW9zaXRlOm1pY3Jvc29mdCIsImdlb3NpdGU6YXBwbGUiLCJnZW9zaXRlOmVwaWNnYW1lcyIsImdlb3NpdGU6cmlvdCIsImdlb3NpdGU6ZXNjYXBlZnJvbXRhcmtvdiIsImdlb3NpdGU6c3RlYW0iLCJnZW9zaXRlOnR3aXRjaCIsImdlb3NpdGU6cGludGVyZXN0IiwiZ2Vvc2l0ZTpmYWNlaXQiXSwiRGlyZWN0SXAiOlsiZ2VvaXA6cHJpdmF0ZSIsImdlb2lwOmRpcmVjdCJdLCJQcm94eVNpdGVzIjpbImdlb3NpdGU6Z29vZ2xlLXBsYXkiLCJnZW9zaXRlOmdpdGh1YiIsImdlb3NpdGU6dHdpdGNoLWFkcyIsImdlb3NpdGU6eW91dHViZSIsImdlb3NpdGU6dGVsZWdyYW0iXSwiUHJveHlJcCI6W10sIkJsb2NrU2l0ZXMiOlsiZ2Vvc2l0ZTp3aW4tc3B5IiwiZ2Vvc2l0ZTp0b3JyZW50IiwiZ2Vvc2l0ZTpjYXRlZ29yeS1hZHMiXSwiQmxvY2tJcCI6W10sIkRvbWFpblN0cmF0ZWd5IjoiSVBJZk5vbk1hdGNoIiwiRmFrZUROUyI6ImZhbHNlIn0K"
 }
 
 for k, v in settings_map.items():
