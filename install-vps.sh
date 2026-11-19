@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # ============================================================================
-# Установщик 3x-ui 3.11+ + Nginx HTTP/2 XHTTP + Security Stack (v3)
+# Установщик 3x-ui 3.11+ + Nginx HTTP/2 XHTTP + Security Stack (v4)
 # Инбаунды: XHTTP Packet-UP ("Мобилы") + Stream-One ("Домашний") + TCP Reality Self-Steal ("Reality") без клиентов
 # Маршрутизация: api->api, блокировка BitTorrent, Private IPs, Ads, Malware
 # Поддержка: Ubuntu 24.04 LTS | Маска: CloudDisk (mock API) / VAPEN Cloud Storage (S3) / Reverse Proxy
@@ -10,7 +10,7 @@ set -euo pipefail
 #
 # Неинтерактивный запуск (пример):
 #   NON_INTERACTIVE=1 DOMAIN=node.example.com MASK_MODE=vapen COMPANY_NAME="VAPEN" \
-#   ENABLE_SCANNERS_BLOCK=Y SKIP_UPGRADE=1 bash install-vps-v3.sh
+#   ENABLE_SCANNERS_BLOCK=Y SKIP_UPGRADE=1 bash install-vps-v4.sh
 # Доступные переменные окружения:
 #   NON_INTERACTIVE=1, AUTO_CONFIRM=1, SKIP_UPGRADE=1, AUTO_UPGRADE=1,
 #   IGNORE_DNS_CHECK=1, SSH_NEW_PORT=2222, DOMAIN, LE_EMAIL, MASK_MODE (disk|vapen|proxy),
@@ -44,7 +44,7 @@ log_err()   { echo -e "${RED}[ERROR]${NC} $1";  _log_file_write "[ERROR] $1"; ex
 [[ $EUID -ne 0 ]] && log_err "Запустите скрипт от имени root (sudo bash $0)."
 
 touch "${LOG_FILE}" && chmod 600 "${LOG_FILE}"
-_log_file_write "=== Запуск установщика 3x-ui v3 ==="
+_log_file_write "=== Запуск установщика 3x-ui v4 ==="
 
 if [[ -f /etc/os-release ]]; then
     . /etc/os-release
@@ -110,6 +110,49 @@ ensure_ssh_service_mode() {
 
 ensure_ssh_service_mode
 
+# Защита APT от зависаний (ForceIPv4, отключение pipelining, таймаут 15с)
+configure_apt_resilience() {
+    cat <<'EOF' > /etc/apt/apt.conf.d/99fix-apt-hang
+Acquire::ForceIPv4 "true";
+Acquire::http::Pipeline-Depth "0";
+Acquire::http::No-Cache "true";
+Acquire::BrokenProxy "true";
+Acquire::http::Timeout "15";
+Acquire::https::Timeout "15";
+Acquire::Retries "2";
+EOF
+}
+
+# Надёжное обновление списков APT с таймаутом и автопереключением archive.ubuntu.com -> nl.archive.ubuntu.com
+safe_apt_update() {
+    export DEBIAN_FRONTEND=noninteractive
+    if timeout 45 apt-get update -qq; then
+        return 0
+    fi
+
+    log_warn "apt-get update завис или завершился ошибкой. Проверяем зеркало Ubuntu..."
+    rm -rf /var/lib/apt/lists/partial/* 2>/dev/null || true
+
+    local switched=0
+    for f in /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list; do
+        if [[ -f "$f" ]] && grep -qE 'https?://archive\.ubuntu\.com/ubuntu' "$f"; then
+            sed -i -E 's|https?://archive\.ubuntu\.com/ubuntu|http://nl.archive.ubuntu.com/ubuntu|g' "$f"
+            switched=1
+        fi
+    done
+
+    if [[ "$switched" -eq 1 ]]; then
+        log_info "Зеркало переключено на http://nl.archive.ubuntu.com/ubuntu — повторный apt-get update..."
+        rm -rf /var/lib/apt/lists/* 2>/dev/null || true
+    else
+        log_info "Повторный запуск apt-get update после очистки partial-кэша..."
+    fi
+
+    timeout 60 apt-get update -qq || log_err "Не удалось выполнить apt-get update (проверьте сеть или зеркала в /etc/apt/)."
+}
+
+configure_apt_resilience
+
 check_system_updates() {
     if [[ "${SKIP_UPGRADE:-0}" == "1" ]]; then
         log_info "Проверка обновлений системы пропущена (SKIP_UPGRADE=1)."
@@ -117,7 +160,7 @@ check_system_updates() {
     fi
     log_info "Проверка наличия обновлений системы..."
     export DEBIAN_FRONTEND=noninteractive
-    apt-get update -qq
+    safe_apt_update
     local upgradable_count
     upgradable_count=$(apt-get -s upgrade 2>/dev/null | grep -c '^Inst ' || true)
     if [[ "${upgradable_count}" -gt 0 ]]; then
@@ -160,7 +203,7 @@ check_system_updates
 if ! command -v python3 >/dev/null 2>&1 || ! command -v openssl >/dev/null 2>&1 || ! command -v curl >/dev/null 2>&1; then
     log_info "Установка базовых зависимостей (python3, openssl, curl)..."
     export DEBIAN_FRONTEND=noninteractive
-    apt-get update -qq
+    safe_apt_update
     apt-get install -y -qq python3 openssl curl ca-certificates
 fi
 
@@ -381,7 +424,7 @@ exec > >(tee -a "${LOG_FILE}") 2>&1
 # 3. Установка базовых пакетов и официального Nginx
 log_info "Обновление пакетов и установка базовых утилит..."
 export DEBIAN_FRONTEND=noninteractive
-apt-get update -qq
+safe_apt_update
 apt-get install -y -qq curl wget gnupg2 ca-certificates lsb-release ubuntu-keyring \
     sqlite3 python3 jq socat certbot ufw fail2ban nftables
 
@@ -389,7 +432,7 @@ log_info "Подключение официального репозитория
 curl -fsSL https://nginx.org/keys/nginx_signing.key | gpg --dearmor -o /usr/share/keyrings/nginx-archive-keyring.gpg --yes
 echo "deb [signed-by=/usr/share/keyrings/nginx-archive-keyring.gpg] http://nginx.org/packages/ubuntu $(lsb_release -cs) nginx" > /etc/apt/sources.list.d/nginx.list
 printf "Package: *\nPin: origin nginx.org\nPin: release o=nginx\nPin-Priority: 900\n" > /etc/apt/preferences.d/99nginx
-apt-get update -qq
+safe_apt_update
 apt-get install -y -qq nginx
 
 id -u www-data &>/dev/null || useradd -r -s /usr/sbin/nologin www-data
@@ -2172,7 +2215,7 @@ systemctl restart fail2ban
 # 12. Установка и настройка CrowdSec + nftables bouncer
 log_info "Установка CrowdSec и nftables firewall bouncer..."
 curl -s https://install.crowdsec.net | sh >/dev/null 2>&1 || log_warn "Репозиторий CrowdSec недоступен, используем пакеты Ubuntu 24.04..."
-apt-get update -qq
+safe_apt_update
 apt-get install -y -qq crowdsec crowdsec-firewall-bouncer-nftables
 
 cscli collections install crowdsecurity/linux crowdsecurity/sshd crowdsecurity/nginx --force >/dev/null 2>&1 || true
@@ -2745,7 +2788,7 @@ clean_server() {
     apt-get purge -y -qq nginx nginx-common nginx-core >/dev/null 2>&1 || true
     rm -rf /etc/nginx /var/log/nginx /var/cache/nginx /var/www/myfakesite /var/www/html/404.html \
            /etc/systemd/system/nginx.service.d /etc/apt/sources.list.d/nginx.list \
-           /usr/share/keyrings/nginx-archive-keyring.gpg /etc/apt/preferences.d/99nginx
+           /usr/share/keyrings/nginx-archive-keyring.gpg /etc/apt/preferences.d/99nginx /etc/apt/apt.conf.d/99fix-apt-hang
 
     echo -e "${YELLOW}[3/6] Удаление CrowdSec и Fail2Ban...${NC}"
     systemctl stop crowdsec crowdsec-firewall-bouncer fail2ban 2>/dev/null || true
