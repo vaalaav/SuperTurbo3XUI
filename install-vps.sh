@@ -2,11 +2,19 @@
 set -euo pipefail
 
 # ============================================================================
-# Интерактивный установщик 3x-ui 3.11+ + Nginx HTTP/2 XHTTP + Security Stack
+# Установщик 3x-ui 3.11+ + Nginx HTTP/2 XHTTP + Security Stack (v3)
 # Инбаунды: XHTTP Packet-UP ("Мобилы") + Stream-One ("Домашний") + TCP Reality Self-Steal ("Reality") без клиентов
 # Маршрутизация: api->api, блокировка BitTorrent, Private IPs, Ads, Malware
-# Поддержка: Ubuntu 24.04 LTS | Маска: «Облачный диск» (mock API) / «VAPEN Cloud Storage» (S3) / Reverse Proxy
+# Поддержка: Ubuntu 24.04 LTS | Маска: CloudDisk (mock API) / VAPEN Cloud Storage (S3) / Reverse Proxy
 # Защита: UFW + Fail2Ban + CrowdSec + C24Be AS_Network_List + CyberOK_Skipa_ips
+#
+# Неинтерактивный запуск (пример):
+#   NON_INTERACTIVE=1 DOMAIN=node.example.com MASK_MODE=vapen COMPANY_NAME="VAPEN" \
+#   ENABLE_SCANNERS_BLOCK=Y SKIP_UPGRADE=1 bash install-vps-v3.sh
+# Доступные переменные окружения:
+#   NON_INTERACTIVE=1, AUTO_CONFIRM=1, SKIP_UPGRADE=1, AUTO_UPGRADE=1,
+#   IGNORE_DNS_CHECK=1, SSH_NEW_PORT=2222, DOMAIN, LE_EMAIL, MASK_MODE (disk|vapen|proxy),
+#   COMPANY_NAME, REVERSE_PROXY_URL, PANEL_USER, PANEL_PASS, ENABLE_SCANNERS_BLOCK (Y|N)
 # ============================================================================
 
 RED='\033[0;31m'
@@ -16,18 +24,35 @@ CYAN='\033[0;36m'
 BOLD='\033[1m'
 NC='\033[0m'
 
-log_info()  { echo -e "${CYAN}[INFO]${NC} $1"; }
-log_ok()    { echo -e "${GREEN}[OK]${NC} $1"; }
-log_warn()  { echo -e "${YELLOW}[WARN]${NC} $1"; }
-log_err()   { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
+LOG_FILE="/var/log/my3xui-install.log"
+LOG_STREAM_ACTIVE=0
+NON_INTERACTIVE="${NON_INTERACTIVE:-0}"
+AUTO_CONFIRM="${AUTO_CONFIRM:-$NON_INTERACTIVE}"
 
-# 1. Проверка прав и ОС (только Ubuntu 24.04 LTS)
+_log_file_write() {
+    if [[ "${LOG_STREAM_ACTIVE}" -eq 0 && -w "${LOG_FILE}" ]]; then
+        printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1" >> "${LOG_FILE}" || true
+    fi
+}
+
+log_info()  { echo -e "${CYAN}[INFO]${NC} $1";  _log_file_write "[INFO] $1"; }
+log_ok()    { echo -e "${GREEN}[OK]${NC} $1";   _log_file_write "[OK] $1"; }
+log_warn()  { echo -e "${YELLOW}[WARN]${NC} $1"; _log_file_write "[WARN] $1"; }
+log_err()   { echo -e "${RED}[ERROR]${NC} $1";  _log_file_write "[ERROR] $1"; exit 1; }
+
+# 1. Проверка прав, инициализация лога и проверка ОС (только Ubuntu 24.04 LTS)
 [[ $EUID -ne 0 ]] && log_err "Запустите скрипт от имени root (sudo bash $0)."
+
+touch "${LOG_FILE}" && chmod 600 "${LOG_FILE}"
+_log_file_write "=== Запуск установщика 3x-ui v3 ==="
 
 if [[ -f /etc/os-release ]]; then
     . /etc/os-release
     if [[ "$ID" != "ubuntu" ]] || [[ "$VERSION_ID" != "24.04" ]]; then
         log_warn "Обнаружена ОС: ${PRETTY_NAME:-Unknown}. Скрипт предназначен для Ubuntu 24.04 LTS."
+        if [[ "${NON_INTERACTIVE}" == "1" ]]; then
+            log_err "Неинтерактивный режим прерван: неподдерживаемая ОС."
+        fi
         read -erp "Продолжить на свой страх и риск? [y/N]: " cont
         [[ ! "$cont" =~ ^[Yy]$ ]] && exit 1
     fi
@@ -35,7 +60,61 @@ else
     log_err "Не удалось определить ОС (/etc/os-release не найден)."
 fi
 
+# Защита нестандартного порта SSH на Ubuntu 24.04 (отключение ssh.socket -> ssh.service)
+ensure_ssh_service_mode() {
+    mkdir -p /run/sshd
+    local cfg_port=""
+    if command -v sshd >/dev/null 2>&1; then
+        cfg_port=$(sshd -T 2>/dev/null | awk '/^port / {print $2; exit}' || true)
+    fi
+    cfg_port=${cfg_port:-22}
+
+    # Опциональная смена порта SSH через переменную окружения SSH_NEW_PORT
+    if [[ -n "${SSH_NEW_PORT:-}" ]]; then
+        if ! [[ "${SSH_NEW_PORT}" =~ ^[0-9]+$ ]] || [[ "${SSH_NEW_PORT}" -lt 1 || "${SSH_NEW_PORT}" -gt 65535 ]]; then
+            log_err "Некорректный порт SSH_NEW_PORT=${SSH_NEW_PORT} (допустимо 1..65535)."
+        fi
+        if [[ "${SSH_NEW_PORT}" != "${cfg_port}" ]]; then
+            log_info "Настройка порта SSH на ${SSH_NEW_PORT} (/etc/ssh/sshd_config.d/99-custom-port.conf)..."
+            mkdir -p /etc/ssh/sshd_config.d
+            printf "Port %s\n" "${SSH_NEW_PORT}" > /etc/ssh/sshd_config.d/99-custom-port.conf
+            if ! sshd -t 2>/dev/null; then
+                rm -f /etc/ssh/sshd_config.d/99-custom-port.conf
+                log_err "Ошибка проверки конфигурации sshd после смены порта на ${SSH_NEW_PORT}."
+            fi
+            cfg_port="${SSH_NEW_PORT}"
+        fi
+    fi
+
+    # Если задан нестандартный порт SSH, отключаем ssh.socket и переводим на ssh.service,
+    # иначе после apt upgrade или перезагрузки Ubuntu 24.04 сбросит порт обратно на 22.
+    if [[ "${cfg_port}" != "22" ]]; then
+        if systemctl is-active --quiet ssh.socket 2>/dev/null || systemctl is-enabled --quiet ssh.socket 2>/dev/null; then
+            log_warn "Обнаружен нестандартный порт SSH (${cfg_port}) при активном ssh.socket (Ubuntu 24.04)."
+            log_info "Отключение ssh.socket и перевод SSH на ssh.service для сохранения порта после перезагрузки..."
+            if sshd -t 2>/dev/null; then
+                systemctl disable --now ssh.socket >/dev/null 2>&1 || true
+                systemctl enable --now ssh.service >/dev/null 2>&1 || true
+                systemctl restart ssh.service
+                log_ok "SSH переведён на ssh.service (порт ${cfg_port} зафиксирован)."
+            else
+                log_warn "sshd -t вернул ошибку — ssh.socket не изменён. Проверьте /etc/ssh/sshd_config вручную!"
+            fi
+        elif [[ -n "${SSH_NEW_PORT:-}" ]]; then
+            systemctl enable --now ssh.service >/dev/null 2>&1 || true
+            systemctl restart ssh.service
+            log_ok "SSH перезапущен на порту ${cfg_port}."
+        fi
+    fi
+}
+
+ensure_ssh_service_mode
+
 check_system_updates() {
+    if [[ "${SKIP_UPGRADE:-0}" == "1" ]]; then
+        log_info "Проверка обновлений системы пропущена (SKIP_UPGRADE=1)."
+        return 0
+    fi
     log_info "Проверка наличия обновлений системы..."
     export DEBIAN_FRONTEND=noninteractive
     apt-get update -qq
@@ -43,19 +122,28 @@ check_system_updates() {
     upgradable_count=$(apt-get -s upgrade 2>/dev/null | grep -c '^Inst ' || true)
     if [[ "${upgradable_count}" -gt 0 ]]; then
         log_warn "Доступно обновлений пакетов: ${upgradable_count}."
-        read -erp "Установить системные обновления перед началом установки? [Y/n]: " DO_UPGRADE
-        DO_UPGRADE=${DO_UPGRADE:-"Y"}
-        if [[ "$DO_UPGRADE" =~ ^[Yy]$ ]]; then
+        local do_upgrade="Y"
+        if [[ "${NON_INTERACTIVE}" == "1" ]]; then
+            do_upgrade=$( [[ "${AUTO_UPGRADE:-0}" == "1" ]] && echo "Y" || echo "N" )
+        else
+            read -erp "Установить системные обновления перед началом установки? [Y/n]: " do_upgrade
+            do_upgrade=${do_upgrade:-"Y"}
+        fi
+        if [[ "$do_upgrade" =~ ^[Yy]$ ]]; then
             log_info "Установка обновлений системы..."
             apt-get upgrade -y -qq -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold"
             log_ok "Система успешно обновлена."
+            # Повторная проверка после обновления openssh-server, чтобы ssh.socket не включился обратно
+            ensure_ssh_service_mode
             if [[ -f /var/run/reboot-required ]]; then
                 log_warn "Обновление затронуло ядро или системные библиотеки — рекомендуется перезагрузка."
-                read -erp "Перезагрузить сервер сейчас (после перезагрузки запустите скрипт снова)? [y/N]: " DO_REBOOT
-                if [[ "$DO_REBOOT" =~ ^[Yy]$ ]]; then
-                    log_info "Перезагрузка сервера..."
-                    reboot
-                    exit 0
+                if [[ "${NON_INTERACTIVE}" != "1" ]]; then
+                    read -erp "Перезагрузить сервер сейчас (после перезагрузки запустите скрипт снова)? [y/N]: " DO_REBOOT
+                    if [[ "$DO_REBOOT" =~ ^[Yy]$ ]]; then
+                        log_info "Перезагрузка сервера..."
+                        reboot
+                        exit 0
+                    fi
                 fi
             fi
         else
@@ -76,80 +164,125 @@ if ! command -v python3 >/dev/null 2>&1 || ! command -v openssl >/dev/null 2>&1 
     apt-get install -y -qq python3 openssl curl ca-certificates
 fi
 
-clear
+[[ "${NON_INTERACTIVE}" != "1" ]] && clear
 echo -e "${BOLD}${CYAN}=================================================================${NC}"
 echo -e "${BOLD}   Установка 3x-ui (XHTTP + TCP Reality Self-Steal) + Security      ${NC}"
 echo -e "${BOLD}${CYAN}=================================================================${NC}\n"
 
-# 2. Интерактивный ввод параметров и предварительная проверка DNS
-while true; do
-    read -erp "1. Введите ваш основной домен (например, node.example.com): " DOMAIN
+# 2. Ввод параметров (интерактивно или через переменные окружения) и проверка DNS
+if [[ -n "${DOMAIN:-}" ]]; then
     DOMAIN=$(echo "$DOMAIN" | LC_ALL=C tr -cd "a-zA-Z0-9.-" | tr "A-Z" "a-z")
-    [[ -n "$DOMAIN" && "$DOMAIN" == *.* ]] && break
-    echo -e "${RED}Некорректный домен. Попробуйте снова.${NC}"
-done
+    [[ -z "$DOMAIN" || "$DOMAIN" != *.* ]] && log_err "Передан некорректный DOMAIN=${DOMAIN}."
+    log_info "Используется домен из окружения: ${DOMAIN}"
+else
+    [[ "${NON_INTERACTIVE}" == "1" ]] && log_err "Для NON_INTERACTIVE=1 необходимо указать переменную DOMAIN."
+    while true; do
+        read -erp "1. Введите ваш основной домен (например, node.example.com): " DOMAIN
+        DOMAIN=$(echo "$DOMAIN" | LC_ALL=C tr -cd "a-zA-Z0-9.-" | tr "A-Z" "a-z")
+        [[ -n "$DOMAIN" && "$DOMAIN" == *.* ]] && break
+        echo -e "${RED}Некорректный домен. Попробуйте снова.${NC}"
+    done
+fi
 
 SERVER_IP=$(curl -4 -fsSL --max-time 5 https://api.ipify.org 2>/dev/null || curl -4 -fsSL --max-time 5 https://ifconfig.me/ip 2>/dev/null || true)
 DOMAIN_IPS=$(getent ahostsv4 "$DOMAIN" 2>/dev/null | awk '{print $1}' | sort -u || true)
 if [[ -z "$DOMAIN_IPS" ]]; then
     log_warn "Домен ${DOMAIN} сейчас не резолвится в IPv4 (A-запись не найдена)!"
-    read -erp "Certbot не сможет выпустить сертификат без DNS. Всё равно продолжить? [y/N]: " dns_cont
-    [[ ! "$dns_cont" =~ ^[Yy]$ ]] && exit 1
+    if [[ "${NON_INTERACTIVE}" == "1" ]]; then
+        [[ "${IGNORE_DNS_CHECK:-0}" != "1" ]] && log_err "DNS-проверка не пройдена (укажите IGNORE_DNS_CHECK=1 для пропуска)."
+    else
+        read -erp "Certbot не сможет выпустить сертификат без DNS. Всё равно продолжить? [y/N]: " dns_cont
+        [[ ! "$dns_cont" =~ ^[Yy]$ ]] && exit 1
+    fi
 elif [[ -n "$SERVER_IP" ]] && ! grep -qx "$SERVER_IP" <<< "$DOMAIN_IPS"; then
     log_warn "Домен ${DOMAIN} указывает на (${DOMAIN_IPS//$'\n'/, }), а IP этого сервера: ${SERVER_IP}!"
-    read -erp "Выпуск SSL-сертификата Let's Encrypt упадёт, если включен прокси/CDN или неверный IP. Продолжить? [y/N]: " dns_cont
-    [[ ! "$dns_cont" =~ ^[Yy]$ ]] && exit 1
+    if [[ "${NON_INTERACTIVE}" == "1" ]]; then
+        [[ "${IGNORE_DNS_CHECK:-0}" != "1" ]] && log_err "IP домена не совпадает с IP сервера (укажите IGNORE_DNS_CHECK=1 для пропуска)."
+    else
+        read -erp "Выпуск SSL-сертификата Let's Encrypt упадёт, если включен прокси/CDN или неверный IP. Продолжить? [y/N]: " dns_cont
+        [[ ! "$dns_cont" =~ ^[Yy]$ ]] && exit 1
+    fi
 else
     log_ok "DNS-проверка пройдена: ${DOMAIN} -> ${SERVER_IP:-OK}"
 fi
 
-read -erp "2. Введите Email для Let's Encrypt [admin@${DOMAIN}]: " LE_EMAIL
-LE_EMAIL=${LE_EMAIL:-"admin@${DOMAIN}"}
+if [[ -n "${LE_EMAIL:-}" ]]; then
+    log_info "Email Let's Encrypt из окружения: ${LE_EMAIL}"
+elif [[ "${NON_INTERACTIVE}" == "1" ]]; then
+    LE_EMAIL="admin@${DOMAIN}"
+else
+    read -erp "2. Введите Email для Let's Encrypt [admin@${DOMAIN}]: " LE_EMAIL
+    LE_EMAIL=${LE_EMAIL:-"admin@${DOMAIN}"}
+fi
 
-echo -e "\n3. Режим маскировки основного домена (${DOMAIN}):"
-printf "   ${BOLD}%-13s${NC} — %s\n" "[Enter] / 1" "«CloudDisk»: mock API и форма входа (рекомендуется)"
-printf "   ${BOLD}%-13s${NC} — %s\n" "2 / vapen"   "Портал облачного хранилища под вашим названием (S3: /s3, /api/v1/health)"
-printf "   ${BOLD}%-13s${NC} — %s\n" "[URL]"       "Reverse Proxy на другой сайт (например, https://example.org)"
-REVERSE_PROXY_URL=""
-while true; do
-    read -erp "   Ваш выбор [1]: " MASK_INPUT
-    MASK_INPUT=$(echo "$MASK_INPUT" | tr -d '[:space:]')
-    case "${MASK_INPUT,,}" in
-        ""|1|disk)
-            MASK_MODE="disk"
-            break
-            ;;
-        2|vapen)
-            MASK_MODE="vapen"
-            break
-            ;;
-        http://*|https://*)
-            if [[ "$MASK_INPUT" =~ ^https?://[A-Za-z0-9.-]+(:[0-9]+)?(/.*)?$ ]]; then
-                MASK_MODE="proxy"
-                REVERSE_PROXY_URL="$MASK_INPUT"
-                MASK_LABEL="Reverse Proxy → ${MASK_INPUT}"
-                break
+REVERSE_PROXY_URL="${REVERSE_PROXY_URL:-}"
+if [[ -n "${MASK_MODE:-}" ]]; then
+    case "${MASK_MODE,,}" in
+        1|disk)  MASK_MODE="disk" ;;
+        2|vapen) MASK_MODE="vapen" ;;
+        proxy)
+            if [[ ! "$REVERSE_PROXY_URL" =~ ^https?://[A-Za-z0-9.-]+(:[0-9]+)?(/.*)?$ ]]; then
+                log_err "Для MASK_MODE=proxy укажите корректный REVERSE_PROXY_URL (например, https://example.org)."
             fi
-            echo -e "   ${RED}Некорректный URL. Укажите адрес вида https://example.org${NC}"
+            MASK_MODE="proxy"
+            MASK_LABEL="Reverse Proxy → ${REVERSE_PROXY_URL}"
             ;;
-        *)
-            echo -e "   ${RED}Неверный выбор. Введите 1, 2 или корректный URL (https://...).${NC}"
-            ;;
+        *) log_err "Некорректный MASK_MODE=${MASK_MODE} (допустимо: disk, vapen, proxy)." ;;
     esac
-done
+elif [[ "${NON_INTERACTIVE}" == "1" ]]; then
+    MASK_MODE="disk"
+else
+    echo -e "\n3. Режим маскировки основного домена (${DOMAIN}):"
+    printf "   ${BOLD}%-13s${NC} — %s\n" "[Enter] / 1" "«CloudDisk»: mock API и форма входа (рекомендуется)"
+    printf "   ${BOLD}%-13s${NC} — %s\n" "2 / vapen"   "Портал облачного хранилища под вашим названием (S3: /s3, /api/v1/health)"
+    printf "   ${BOLD}%-13s${NC} — %s\n" "[URL]"       "Reverse Proxy на другой сайт (например, https://example.org)"
+    while true; do
+        read -erp "   Ваш выбор [1]: " MASK_INPUT
+        MASK_INPUT=$(echo "$MASK_INPUT" | tr -d '[:space:]')
+        case "${MASK_INPUT,,}" in
+            ""|1|disk)
+                MASK_MODE="disk"
+                break
+                ;;
+            2|vapen)
+                MASK_MODE="vapen"
+                break
+                ;;
+            http://*|https://*)
+                if [[ "$MASK_INPUT" =~ ^https?://[A-Za-z0-9.-]+(:[0-9]+)?(/.*)?$ ]]; then
+                    MASK_MODE="proxy"
+                    REVERSE_PROXY_URL="$MASK_INPUT"
+                    MASK_LABEL="Reverse Proxy → ${MASK_INPUT}"
+                    break
+                fi
+                echo -e "   ${RED}Некорректный URL. Укажите адрес вида https://example.org${NC}"
+                ;;
+            *)
+                echo -e "   ${RED}Неверный выбор. Введите 1, 2 или корректный URL (https://...).${NC}"
+                ;;
+        esac
+    done
+fi
 
-COMPANY_NAME=""; COMPANY_SLUG="STORAGE"
+COMPANY_NAME="${COMPANY_NAME:-}"; COMPANY_SLUG="STORAGE"
 if [[ "$MASK_MODE" == "vapen" || "$MASK_MODE" == "disk" ]]; then
     COMPANY_RE='^[A-Za-z0-9][A-Za-z0-9 ._-]{1,31}$'
     DEFAULT_CO=$( [[ "$MASK_MODE" == "vapen" ]] && echo "VAPEN" || echo "CloudDisk" )
-    while true; do
-        read -erp "   Название компании на английском (например, Nimbus Labs) [${DEFAULT_CO}]: " COMPANY_NAME
-        COMPANY_NAME=$(echo "$COMPANY_NAME" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-        COMPANY_NAME=$(echo "$COMPANY_NAME" | sed -E 's/[[:space:]]+[Cc]loud[[:space:]]+[Ss]torage$//')  # суффикс добавляется автоматически
-        COMPANY_NAME=${COMPANY_NAME:-${DEFAULT_CO}}
-        [[ "$COMPANY_NAME" =~ $COMPANY_RE ]] && break
-        echo -e "   ${RED}Только английский (латиница), цифры, пробел и символы . _ - (от 2 до 32 символов).${NC}"
-    done
+    if [[ -n "$COMPANY_NAME" ]]; then
+        COMPANY_NAME=$(echo "$COMPANY_NAME" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | sed -E 's/[[:space:]]+[Cc]loud[[:space:]]+[Ss]torage$//')
+        [[ ! "$COMPANY_NAME" =~ $COMPANY_RE ]] && log_err "COMPANY_NAME должен быть на английском (латиница, цифры, . _ -, 2..32 символа)."
+    elif [[ "${NON_INTERACTIVE}" == "1" ]]; then
+        COMPANY_NAME="${DEFAULT_CO}"
+    else
+        while true; do
+            read -erp "   Название компании на английском (например, Nimbus Labs) [${DEFAULT_CO}]: " COMPANY_NAME
+            COMPANY_NAME=$(echo "$COMPANY_NAME" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+            COMPANY_NAME=$(echo "$COMPANY_NAME" | sed -E 's/[[:space:]]+[Cc]loud[[:space:]]+[Ss]torage$//')  # суффикс добавляется автоматически
+            COMPANY_NAME=${COMPANY_NAME:-${DEFAULT_CO}}
+            [[ "$COMPANY_NAME" =~ $COMPANY_RE ]] && break
+            echo -e "   ${RED}Только английский (латиница), цифры, пробел и символы . _ - (от 2 до 32 символов).${NC}"
+        done
+    fi
     COMPANY_SLUG=$(echo "$COMPANY_NAME" | tr -cd 'A-Za-z0-9' | tr 'a-z' 'A-Z' | cut -c1-16)
     COMPANY_SLUG=${COMPANY_SLUG:-STORAGE}
     if [[ "$MASK_MODE" == "vapen" ]]; then
@@ -161,8 +294,14 @@ fi
 
 # Генерация сложных случайных логина (12 симв.) и пароля (20 симв. со спецсимволами)
 RAND_USER=$(python3 -c 'import secrets, string; alphabet = string.ascii_letters + string.digits; print("".join(secrets.choice(alphabet) for _ in range(12)))')
-read -erp "4. Логин администратора 3x-ui [${RAND_USER}]: " PANEL_USER
-PANEL_USER=${PANEL_USER:-"$RAND_USER"}
+if [[ -z "${PANEL_USER:-}" ]]; then
+    if [[ "${NON_INTERACTIVE}" == "1" ]]; then
+        PANEL_USER="$RAND_USER"
+    else
+        read -erp "4. Логин администратора 3x-ui [${RAND_USER}]: " PANEL_USER
+        PANEL_USER=${PANEL_USER:-"$RAND_USER"}
+    fi
+fi
 
 RAND_PASS=$(python3 -c '
 import secrets, string
@@ -175,12 +314,24 @@ while True:
         print(pwd)
         break
 ')
-read -erp "5. Пароль администратора 3x-ui [${RAND_PASS}]: " PANEL_PASS
-PANEL_PASS=${PANEL_PASS:-"$RAND_PASS"}
+if [[ -z "${PANEL_PASS:-}" ]]; then
+    if [[ "${NON_INTERACTIVE}" == "1" ]]; then
+        PANEL_PASS="$RAND_PASS"
+    else
+        read -erp "5. Пароль администратора 3x-ui [${RAND_PASS}]: " PANEL_PASS
+        PANEL_PASS=${PANEL_PASS:-"$RAND_PASS"}
+    fi
+fi
 
-echo -e "\n6. Блокировать IP/подсети сканеров и госструктур РФ (C24Be AS_Network_List + CyberOK Skipa) в nftables?"
-read -erp "   (Рекомендуется, сжатие CIDR + автообновление раз в сутки; также управляемо через my3xui) [Y/n]: " ENABLE_SCANNERS_BLOCK
-ENABLE_SCANNERS_BLOCK=${ENABLE_SCANNERS_BLOCK:-"Y"}
+if [[ -z "${ENABLE_SCANNERS_BLOCK:-}" ]]; then
+    if [[ "${NON_INTERACTIVE}" == "1" ]]; then
+        ENABLE_SCANNERS_BLOCK="Y"
+    else
+        echo -e "\n6. Блокировать IP/подсети сканеров и госструктур РФ (C24Be AS_Network_List + CyberOK Skipa) в nftables?"
+        read -erp "   (Рекомендуется, сжатие CIDR + автообновление раз в сутки; также управляемо через my3xui) [Y/n]: " ENABLE_SCANNERS_BLOCK
+        ENABLE_SCANNERS_BLOCK=${ENABLE_SCANNERS_BLOCK:-"Y"}
+    fi
+fi
 
 PANEL_PORT=$(shuf -i 40000-48000 -n 1)
 SUB_PORT=$(shuf -i 48001-56000 -n 1)
@@ -216,10 +367,16 @@ echo "  • Порт подписки:  127.0.0.1:${SUB_PORT} (путь /${SUB_P
 echo "  • Логин панели:   ${PANEL_USER}"
 echo "  • Безопасность:   UFW (SSH:${SSH_PORT}, 80, 443) + Fail2Ban + CrowdSec"
 echo "  • Блок сканеров:  $([[ "$ENABLE_SCANNERS_BLOCK" =~ ^[Yy]$ ]] && echo 'C24Be + CyberOK Skipa (nftables)' || echo 'Отключено (доступно в my3xui)')"
+echo "  • Лог установки:  ${LOG_FILE}"
 echo "  • CLI-утилита:    my3xui (status, info, creds, crowdsec, blocklist, whitelist, backup, clean)"
 echo ""
-read -erp "Начать установку? [Y/n]: " START_CONFIRM
-[[ "$START_CONFIRM" =~ ^[Nn]$ ]] && exit 0
+if [[ "${AUTO_CONFIRM}" != "1" ]]; then
+    read -erp "Начать установку? [Y/n]: " START_CONFIRM
+    [[ "$START_CONFIRM" =~ ^[Nn]$ ]] && exit 0
+fi
+
+LOG_STREAM_ACTIVE=1
+exec > >(tee -a "${LOG_FILE}") 2>&1
 
 # 3. Установка базовых пакетов и официального Nginx
 log_info "Обновление пакетов и установка базовых утилит..."
@@ -305,13 +462,20 @@ BUSY_PORTS=$(ss -tlnp 2>/dev/null | grep -E ':(80|443)[[:space:]]' || true)
 if [[ -n "$BUSY_PORTS" ]]; then
     log_warn "Порты 80 или 443 заняты другим процессом:\n${BUSY_PORTS}"
     if systemctl is-active --quiet apache2 2>/dev/null; then
-        read -erp "Обнаружен работающий apache2. Остановить и отключить его? [Y/n]: " STOP_APACHE
-        STOP_APACHE=${STOP_APACHE:-"Y"}
+        if [[ "${NON_INTERACTIVE}" == "1" ]]; then
+            STOP_APACHE="Y"
+        else
+            read -erp "Обнаружен работающий apache2. Остановить и отключить его? [Y/n]: " STOP_APACHE
+            STOP_APACHE=${STOP_APACHE:-"Y"}
+        fi
         if [[ "$STOP_APACHE" =~ ^[Yy]$ ]]; then
             systemctl disable --now apache2 >/dev/null 2>&1 || true
             log_ok "apache2 остановлен и отключён."
         fi
     else
+        if [[ "${NON_INTERACTIVE}" == "1" ]]; then
+            log_err "Порты 80/443 заняты другим процессом — автоматический выпуск SSL невозможен."
+        fi
         read -erp "Certbot не сможет выпустить сертификат при занятом порте 80. Продолжить? [y/N]: " PORT_CONT
         [[ ! "$PORT_CONT" =~ ^[Yy]$ ]] && exit 1
     fi
@@ -2603,7 +2767,7 @@ clean_server() {
 
     echo -e "${YELLOW}[5/6] Удаление сертификатов, sysctl-тюнинга и логов установки...${NC}"
     rm -rf /root/cert /etc/letsencrypt/renewal-hooks/deploy/reload-services.sh \
-           /etc/sysctl.d/99-xray-custom.conf /root/vps-credentials.txt
+           /etc/sysctl.d/99-xray-custom.conf /root/vps-credentials.txt /var/log/my3xui-install.log
     if [[ "${DEL_LE:-}" =~ ^[Yy]$ ]]; then
         rm -rf /etc/letsencrypt
     fi
@@ -2676,6 +2840,7 @@ echo -e "  • UFW:           активен (открыты только SSH:${
 echo -e "  • Fail2Ban:      активен (sshd + nginx-scanners + myfakesite-auth через nftables)"
 echo -e "  • CrowdSec:      активен (crowdsec + nftables firewall bouncer)"
 echo -e "  • Блок сканеров: $([[ "$ENABLE_SCANNERS_BLOCK" =~ ^[Yy]$ ]] && echo 'C24Be + CyberOK Skipa (nftables prerouting drop)' || echo 'отключен (my3xui blocklist install)')"
+echo -e "  • Лог установки: ${LOG_FILE}"
 echo -e "  • CLI-утилита:   my3xui (status | info | creds | crowdsec | blocklist | whitelist | backup | clean)"
 
 my3xui creds
