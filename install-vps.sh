@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # ============================================================================
-# Установщик 3x-ui 3.11+ + Nginx HTTP/2 XHTTP + Security Stack (v5)
+# Установщик 3x-ui 3.11+ + Nginx HTTP/2 XHTTP + Security Stack (v7)
 # Инбаунды: XHTTP Packet-UP ("Мобилы") + Stream-One ("Домашний") + TCP Reality Self-Steal ("Reality") без клиентов
 # Маршрутизация: api->api, блокировка BitTorrent, Private IPs, Ads, Malware
 # Поддержка: Ubuntu 24.04 LTS | Маска: CloudDisk (mock API) / VAPEN Cloud Storage (S3) / Reverse Proxy
@@ -10,7 +10,7 @@ set -euo pipefail
 #
 # Неинтерактивный запуск (пример):
 #   NON_INTERACTIVE=1 DOMAIN=node.example.com MASK_MODE=vapen COMPANY_NAME="VAPEN" \
-#   ENABLE_SCANNERS_BLOCK=Y SKIP_UPGRADE=1 bash install-vps-v5.sh
+#   ENABLE_SCANNERS_BLOCK=Y SKIP_UPGRADE=1 bash install-vps-v7.sh
 # Доступные переменные окружения:
 #   NON_INTERACTIVE=1, AUTO_CONFIRM=1, SKIP_UPGRADE=1, AUTO_UPGRADE=1,
 #   IGNORE_DNS_CHECK=1, SSH_NEW_PORT=2222, DOMAIN, LE_EMAIL, MASK_MODE (disk|vapen|proxy),
@@ -44,7 +44,7 @@ log_err()   { echo -e "${RED}[ERROR]${NC} $1";  _log_file_write "[ERROR] $1"; ex
 [[ $EUID -ne 0 ]] && log_err "Запустите скрипт от имени root (sudo bash $0)."
 
 touch "${LOG_FILE}" && chmod 600 "${LOG_FILE}"
-_log_file_write "=== Запуск установщика 3x-ui v5 ==="
+_log_file_write "=== Запуск установщика 3x-ui v7 ==="
 
 if [[ -f /etc/os-release ]]; then
     . /etc/os-release
@@ -411,7 +411,7 @@ echo "  • Логин панели:   ${PANEL_USER}"
 echo "  • Безопасность:   UFW (SSH:${SSH_PORT}, 80, 443) + Fail2Ban + CrowdSec"
 echo "  • Блок сканеров:  $([[ "$ENABLE_SCANNERS_BLOCK" =~ ^[Yy]$ ]] && echo 'C24Be + CyberOK Skipa (nftables)' || echo 'Отключено (доступно в my3xui)')"
 echo "  • Лог установки:  ${LOG_FILE}"
-echo "  • CLI-утилита:    my3xui (status, info, creds, crowdsec, blocklist, whitelist, backup, clean)"
+echo "  • CLI-утилита:    my3xui (status, info, creds, crowdsec, blocklist, whitelist, backup, restore, inbounds, clean)"
 echo ""
 if [[ "${AUTO_CONFIRM}" != "1" ]]; then
     read -erp "Начать установку? [Y/n]: " START_CONFIRM
@@ -1527,7 +1527,7 @@ settings_map = {
     "twoFactorEnable": "false",
 
     # Общие настройки подписки
-    "subUpdates": "12",
+    "subUpdates": "2",
     "subHideSettings": "true",
     "subHostSortMode": "inbound-first",
     "subProfileMode": "none",
@@ -2711,6 +2711,102 @@ create_backup() {
     echo -e "${GREEN}[OK] Бэкап создан: ${archive}${NC}"
 }
 
+restore_backup() {
+    local bdir="/root/backups"
+    local archive="${1:-}"
+
+    if [[ -n "$archive" ]]; then
+        if [[ ! -f "$archive" && -f "${bdir}/${archive}" ]]; then
+            archive="${bdir}/${archive}"
+        fi
+        if [[ ! -f "$archive" ]]; then
+            echo -e "${RED}[ERROR] Файл бэкапа не найден: ${archive}${NC}"
+            return 1
+        fi
+    else
+        mapfile -t archives < <(ls -1t "${bdir}"/my3xui-backup-*.tar.gz 2>/dev/null || true)
+        if [[ ${#archives[@]} -eq 0 ]]; then
+            echo -e "${YELLOW}Резервные копии в ${bdir} не найдены.${NC}"
+            return 1
+        fi
+
+        echo -e "\n${BOLD}${CYAN}=== ВОССТАНОВЛЕНИЕ ИЗ РЕЗЕРВНОЙ КОПИИ ===${NC}"
+        local i=1
+        for a in "${archives[@]}"; do
+            local sz dt
+            sz=$(du -h "$a" 2>/dev/null | awk '{print $1}')
+            dt=$(date -r "$a" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || true)
+            printf "  %d. %s (%s, %s)\n" "$i" "$(basename "$a")" "${sz:-?}" "${dt:-?}"
+            ((i++))
+        done
+        echo "  0. Отмена"
+        echo ""
+        read -erp "Выберите номер бэкапа [0-${#archives[@]}]: " b_choice
+        if [[ "$b_choice" == "0" || -z "$b_choice" ]]; then
+            echo "Отменено."
+            return 0
+        fi
+        if ! [[ "$b_choice" =~ ^[0-9]+$ ]] || [[ "$b_choice" -lt 1 || "$b_choice" -gt ${#archives[@]} ]]; then
+            echo -e "${RED}Неверный выбор.${NC}"
+            return 1
+        fi
+        archive="${archives[$((b_choice - 1))]}"
+    fi
+
+    if ! tar -tzf "$archive" >/dev/null 2>&1; then
+        echo -e "${RED}[ERROR] Архив повреждён или не является корректным .tar.gz: ${archive}${NC}"
+        return 1
+    fi
+
+    echo -e "\nВыбран архив: ${BOLD}${archive}${NC}"
+    echo "  1. Полное восстановление (БД 3x-ui, Nginx, Fail2Ban, белый список, учётные данные)"
+    echo "  2. Восстановить только базу данных 3x-ui (/etc/x-ui/x-ui.db)"
+    echo "  0. Отмена"
+    read -erp "Режим восстановления [1]: " r_mode
+    r_mode=${r_mode:-1}
+    case "$r_mode" in
+        0) echo "Отменено."; return 0 ;;
+        1|2) ;;
+        *) echo -e "${RED}Неверный выбор.${NC}"; return 1 ;;
+    esac
+
+    read -erp "Подтвердить восстановление из $(basename "$archive")? [y/N]: " r_confirm
+    if [[ ! "$r_confirm" =~ ^[Yy]$ ]]; then
+        echo "Отменено."
+        return 0
+    fi
+
+    if [[ "$r_mode" == "2" ]]; then
+        echo -e "${CYAN}[INFO] Остановка x-ui и восстановление /etc/x-ui/x-ui.db...${NC}"
+        systemctl stop x-ui 2>/dev/null || true
+        if ! tar -xzf "$archive" -C / etc/x-ui/x-ui.db 2>/dev/null; then
+            systemctl start x-ui 2>/dev/null || true
+            echo -e "${RED}[ERROR] Файл etc/x-ui/x-ui.db не найден в архиве или ошибка распаковки.${NC}"
+            return 1
+        fi
+        rm -f /usr/local/x-ui/bin/config.json
+        systemctl start x-ui
+        echo -e "${GREEN}[OK] База данных 3x-ui восстановлена, сервис x-ui перезапущен.${NC}"
+    else
+        echo -e "${CYAN}[INFO] Остановка x-ui, nginx, fail2ban и полное восстановление...${NC}"
+        systemctl stop x-ui nginx fail2ban 2>/dev/null || true
+        tar -xzf "$archive" -C /
+        rm -f /usr/local/x-ui/bin/config.json
+        if nginx -t >/dev/null 2>&1; then
+            systemctl start x-ui nginx fail2ban
+            if /usr/sbin/nft list table inet scanners_block &>/dev/null; then
+                /usr/local/sbin/update-scanners-blocklist.sh >/dev/null 2>&1 || true
+            fi
+            echo -e "${GREEN}[OK] Полное восстановление завершено, сервисы запущены.${NC}"
+        else
+            systemctl start x-ui fail2ban 2>/dev/null || true
+            echo -e "${RED}[WARN] Архив распакован, но nginx -t вернул ошибку! Проверьте /etc/nginx/nginx.conf.${NC}"
+            nginx -t || true
+            return 1
+        fi
+    fi
+}
+
 blocklist_status() {
     if /usr/sbin/nft list table inet scanners_block &>/dev/null; then
         PKTS=$(/usr/sbin/nft list chain inet scanners_block prerouting 2>/dev/null | grep -oE 'packets [0-9]+' | tail -n 1 || echo "packets 0")
@@ -2804,6 +2900,319 @@ show_crowdsec() {
     echo ""
 }
 
+recreate_inbounds_exec() {
+    local mode="${1:-restore}"
+    if [[ ! -f /etc/x-ui/x-ui.db ]]; then
+        echo -e "${RED}[ERROR] База данных /etc/x-ui/x-ui.db не найдена.${NC}"
+        return 1
+    fi
+    if [[ ! -f /etc/nginx/nginx.conf ]]; then
+        echo -e "${RED}[ERROR] Конфиг /etc/nginx/nginx.conf не найден — невозможно определить пути XHTTP.${NC}"
+        return 1
+    fi
+
+    echo -e "${CYAN}[INFO] Создание автоматического бэкапа перед изменением инбаундов...${NC}"
+    create_backup || true
+
+    echo -e "${CYAN}[INFO] Остановка x-ui и пересоздание инбаундов (режим: ${mode})...${NC}"
+    systemctl stop x-ui 2>/dev/null || true
+
+    if ! RECREATE_MODE="${mode}" python3 - <<'IBEOF'
+import sqlite3, json, urllib.request, urllib.parse, os, re, glob, subprocess, base64, secrets
+
+mode = os.environ.get("RECREATE_MODE", "restore")
+db_path = "/etc/x-ui/x-ui.db"
+nginx_conf_path = "/etc/nginx/nginx.conf"
+bin_dir = "/usr/local/x-ui/bin"
+
+def detect_server_country():
+    country_names_ru = {
+        "NL": "Нидерланды", "DE": "Германия", "FR": "Франция", "FI": "Финляндия",
+        "SE": "Швеция", "NO": "Норвегия", "DK": "Дания", "GB": "Великобритания",
+        "UK": "Великобритания", "IE": "Ирландия", "PL": "Польша", "CZ": "Чехия",
+        "AT": "Австрия", "CH": "Швейцария", "BE": "Бельгия", "LU": "Люксембург",
+        "ES": "Испания", "IT": "Италия", "PT": "Португалия", "GR": "Греция",
+        "BG": "Болгария", "RO": "Румыния", "HU": "Венгрия", "SK": "Словакия",
+        "SI": "Словения", "HR": "Хорватия", "RS": "Сербия", "EE": "Эстония",
+        "LV": "Латвия", "LT": "Литва", "MD": "Молдова", "UA": "Украина",
+        "BY": "Беларусь", "RU": "Россия", "KZ": "Казахстан", "AM": "Армения",
+        "GE": "Грузия", "AZ": "Азербайджан", "UZ": "Узбекистан", "TR": "Турция",
+        "AE": "ОАЭ", "IL": "Израиль", "CY": "Кипр", "US": "США", "CA": "Канада",
+        "BR": "Бразилия", "AR": "Аргентина", "CL": "Чили", "JP": "Япония",
+        "KR": "Южная Корея", "SG": "Сингапур", "HK": "Гонконг", "TW": "Тайвань",
+        "IN": "Индия", "AU": "Австралия", "NZ": "Новая Зеландия", "ZA": "ЮАР"
+    }
+    ip = ""
+    for ip_url in ("https://api.ipify.org", "https://ifconfig.me/ip", "https://icanhazip.com"):
+        try:
+            req = urllib.request.Request(ip_url, headers={"User-Agent": "curl/8.0"})
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                ip = resp.read().decode("utf-8").strip()
+                if ip:
+                    break
+        except Exception:
+            pass
+    code, fallback_name = "", ""
+    if ip:
+        try:
+            req = urllib.request.Request(f"http://ip-api.com/json/{ip}?fields=status,country,countryCode", headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=6) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                if data.get("status") == "success":
+                    code = (data.get("countryCode") or "").upper()
+                    fallback_name = data.get("country") or ""
+        except Exception:
+            pass
+    if not code:
+        try:
+            url = f"https://ipinfo.io/{ip}/json" if ip else "https://ipinfo.io/json"
+            req = urllib.request.Request(url, headers={"User-Agent": "curl/8.0"})
+            with urllib.request.urlopen(req, timeout=6) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                code = (data.get("country") or "").upper()
+        except Exception:
+            pass
+    if len(code) == 2 and code.isalpha():
+        flag = "".join(chr(0x1F1E6 + ord(c) - ord("A")) for c in code)
+        name = country_names_ru.get(code) or fallback_name or code
+        return f"{flag} {name}"
+    return "🌐 Сервер"
+
+def generate_x25519_keys(bdir):
+    priv_key, pub_key = "", ""
+    for xbin in sorted(glob.glob(os.path.join(bdir, "xray*"))):
+        if os.path.isfile(xbin) and os.access(xbin, os.X_OK):
+            try:
+                out = subprocess.check_output([xbin, "x25519"], text=True, timeout=5)
+                for line in out.splitlines():
+                    if ":" not in line:
+                        continue
+                    k, v = [p.strip() for p in line.split(":", 1)]
+                    kl = k.lower()
+                    if "private" in kl:
+                        priv_key = v
+                    elif "public" in kl or "password" in kl:
+                        pub_key = v
+                if priv_key and pub_key:
+                    return priv_key, pub_key
+            except Exception:
+                pass
+    pem = subprocess.check_output(["openssl", "genpkey", "-algorithm", "X25519"])
+    der_priv = subprocess.check_output(["openssl", "pkey", "-outform", "DER"], input=pem)
+    der_pub = subprocess.check_output(["openssl", "pkey", "-pubout", "-outform", "DER"], input=pem)
+    priv_key = base64.urlsafe_b64encode(der_priv[-32:]).decode().rstrip("=")
+    pub_key = base64.urlsafe_b64encode(der_pub[-32:]).decode().rstrip("=")
+    return priv_key, pub_key
+
+with open(nginx_conf_path, "r", encoding="utf-8") as nf:
+    nginx_conf = nf.read()
+
+m_up = re.search(r"location\s+\^~\s+(/[^/\s][^\s{;]*)\s*\{[^}]*proxy_pass\s+http://xray_xhttp_up;", nginx_conf, re.S)
+m_one = re.search(r"location\s+\^~\s+(/[^/\s][^\s{;]*)\s*\{[^}]*grpc_pass\s+grpc://xray_xhttp_one;", nginx_conf, re.S)
+if not m_up or not m_one:
+    raise SystemExit("Не удалось извлечь пути XHTTP (xray_xhttp_up / xray_xhttp_one) из /etc/nginx/nginx.conf.")
+
+xhttp_up_path = m_up.group(1)
+xhttp_one_path = m_one.group(1)
+
+conn = sqlite3.connect(db_path)
+cur = conn.cursor()
+
+settings = dict(cur.execute("SELECT key, value FROM settings").fetchall())
+domain = urllib.parse.urlparse(settings.get("subURI", "")).hostname
+if not domain:
+    cert_file = settings.get("webCertFile", "")
+    parts = cert_file.split("/")
+    domain = parts[3] if len(parts) > 3 and parts[2] == "cert" else ""
+if not domain:
+    m_dom = re.search(r"server_name\s+([a-zA-Z0-9.-]+\.[a-zA-Z0-9.-]+)\s*;", nginx_conf)
+    domain = m_dom.group(1) if m_dom else ""
+if not domain:
+    conn.close()
+    raise SystemExit("Не удалось определить домен сервера из БД 3x-ui или nginx.conf.")
+
+user_row = cur.execute("SELECT id FROM users LIMIT 1").fetchone()
+user_id = user_row[0] if user_row else 1
+
+base_remark = detect_server_country()
+reality_priv_key, reality_pub_key = generate_x25519_keys(bin_dir)
+reality_short_ids = [secrets.token_hex(2), secrets.token_hex(4), secrets.token_hex(6), secrets.token_hex(8)]
+
+browser_headers = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
+    "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7"
+}
+default_allocate = json.dumps({"strategy": "always", "refresh": 5, "concurrency": 3})
+default_sniffing = json.dumps({
+    "enabled": True,
+    "destOverride": ["http", "tls", "quic", "fakedns"],
+    "metadataOnly": False,
+    "routeOnly": False
+})
+
+inbounds = [
+    {
+        "user_id": user_id,
+        "up": 0, "down": 0, "total": 0,
+        "remark": f"{base_remark} - Мобилы",
+        "enable": 1, "expiry_time": 0,
+        "listen": "127.0.0.1", "port": 11443,
+        "protocol": "vless",
+        "settings": json.dumps({"clients": [], "decryption": "none", "fallbacks": []}),
+        "stream_settings": json.dumps({
+            "network": "xhttp", "security": "none",
+            "externalProxy": [{"forceTls": "tls", "dest": domain, "port": 443, "remark": ""}],
+            "xhttpSettings": {
+                "path": xhttp_up_path, "host": domain, "mode": "packet-up",
+                "noGRPCHeader": True, "xPaddingBytes": "100-1000",
+                "scMaxEachPostBytes": "500000-1000000", "scMinPostsIntervalMs": "10-50",
+                "scMaxBufferedPosts": 30, "scStreamUpServerSecs": "20-80",
+                "headers": browser_headers
+            }
+        }),
+        "tag": "inbound-xhttp-up",
+        "sniffing": default_sniffing, "allocate": default_allocate
+    },
+    {
+        "user_id": user_id,
+        "up": 0, "down": 0, "total": 0,
+        "remark": f"{base_remark} - Домашний",
+        "enable": 1, "expiry_time": 0,
+        "listen": "127.0.0.1", "port": 7443,
+        "protocol": "vless",
+        "settings": json.dumps({"clients": [], "decryption": "none", "fallbacks": []}),
+        "stream_settings": json.dumps({
+            "network": "xhttp", "security": "none",
+            "externalProxy": [{"forceTls": "tls", "dest": domain, "port": 443, "remark": ""}],
+            "xhttpSettings": {
+                "path": xhttp_one_path, "host": domain, "mode": "stream-one",
+                "noGRPCHeader": False, "xPaddingBytes": "100-1000",
+                "headers": browser_headers
+            }
+        }),
+        "tag": "inbound-xhttp-one",
+        "sniffing": default_sniffing, "allocate": default_allocate
+    },
+    {
+        "user_id": user_id,
+        "up": 0, "down": 0, "total": 0,
+        "remark": f"{base_remark} - Reality",
+        "enable": 1, "expiry_time": 0,
+        "listen": "127.0.0.1", "port": 9443,
+        "protocol": "vless",
+        "settings": json.dumps({"clients": [], "decryption": "none", "fallbacks": []}),
+        "stream_settings": json.dumps({
+            "network": "tcp", "security": "reality",
+            "externalProxy": [{"forceTls": "same", "dest": domain, "port": 443, "remark": ""}],
+            "realitySettings": {
+                "show": False, "xver": 1, "target": "127.0.0.1:8443",
+                "serverNames": [domain], "privateKey": reality_priv_key,
+                "minClientVer": "", "maxClientVer": "", "maxTimediff": 0,
+                "shortIds": reality_short_ids, "mldsa65Seed": "",
+                "settings": {
+                    "publicKey": reality_pub_key, "fingerprint": "chrome",
+                    "serverName": "", "spiderX": "/", "mldsa65Verify": ""
+                }
+            },
+            "tcpSettings": {"acceptProxyProtocol": True, "header": {"type": "none"}}
+        }),
+        "tag": "inbound-reality",
+        "sniffing": default_sniffing, "allocate": default_allocate
+    }
+]
+
+extra_defaults = {
+    "all_time": 0,
+    "traffic_reset": "never",
+    "last_traffic_reset_time": 0,
+    "node_id": None
+}
+existing_cols = {row[1] for row in cur.execute("PRAGMA table_info(inbounds)").fetchall()}
+
+if mode == "reset":
+    for tbl in ("inbounds", "client_traffics", "client_inbounds", "clients"):
+        try:
+            cur.execute(f"DELETE FROM {tbl}")
+        except sqlite3.OperationalError:
+            pass
+    created = 0
+    for idx, ib in enumerate(inbounds, 1):
+        merged_ib = {**extra_defaults, "id": idx, **ib}
+        valid_ib = {k: v for k, v in merged_ib.items() if k in existing_cols}
+        cols_sql = ", ".join(valid_ib.keys())
+        vals_sql = ", ".join(f":{k}" for k in valid_ib.keys())
+        cur.execute(f"INSERT INTO inbounds ({cols_sql}) VALUES ({vals_sql})", valid_ib)
+        print(f"  + Создан: {ib['remark']} (127.0.0.1:{ib['port']})")
+        created += 1
+    print(f"Пересоздано инбаундов: {created} (домен: {domain}, XHTTP-пути сохранены из nginx.conf).")
+else:
+    existing_tags = {r[0] for r in cur.execute("SELECT tag FROM inbounds").fetchall()}
+    existing_ports = {r[0] for r in cur.execute("SELECT port FROM inbounds").fetchall()}
+    created = 0
+    for ib in inbounds:
+        if ib["tag"] in existing_tags or ib["port"] in existing_ports:
+            print(f"  = Пропущен (уже существует): {ib['remark']} (порт {ib['port']})")
+            continue
+        merged_ib = {**extra_defaults, **ib}
+        valid_ib = {k: v for k, v in merged_ib.items() if k in existing_cols}
+        cols_sql = ", ".join(valid_ib.keys())
+        vals_sql = ", ".join(f":{k}" for k in valid_ib.keys())
+        cur.execute(f"INSERT INTO inbounds ({cols_sql}) VALUES ({vals_sql})", valid_ib)
+        print(f"  + Восстановлен: {ib['remark']} (127.0.0.1:{ib['port']})")
+        created += 1
+    if created == 0:
+        print("Все 3 стандартных инбаунда уже существуют — изменений не требуется.")
+    else:
+        print(f"Восстановлено инбаундов: {created} (домен: {domain}, XHTTP-пути синхронизированы с nginx.conf).")
+
+conn.commit()
+conn.close()
+IBEOF
+    then
+        systemctl start x-ui 2>/dev/null || true
+        echo -e "${RED}[ERROR] Не удалось пересоздать инбаунды. Сервис x-ui запущен обратно.${NC}"
+        return 1
+    fi
+
+    rm -f /usr/local/x-ui/bin/config.json
+    systemctl start x-ui
+    echo -e "${GREEN}[OK] Сервис x-ui перезапущен с обновлёнными инбаундами.${NC}"
+}
+
+manage_inbounds() {
+    case "${1:-}" in
+        restore)
+            recreate_inbounds_exec "restore"
+            ;;
+        reset)
+            echo -e "${YELLOW}ВНИМАНИЕ: Все текущие инбаунды и клиенты в 3x-ui будут удалены и заменены 3 стандартными!${NC}"
+            read -erp "Продолжить? Введите YES для подтверждения: " IB_CONFIRM
+            [[ "$IB_CONFIRM" != "YES" ]] && { echo "Отменено."; return 0; }
+            recreate_inbounds_exec "reset"
+            ;;
+        *)
+            while true; do
+                echo -e "\n${BOLD}${CYAN}=== УПРАВЛЕНИЕ СТАНДАРТНЫМИ ИНБАУНДАМИ 3X-UI ===${NC}"
+                echo "  1. Восстановить только отсутствующие стандартные инбаунды (безопасно, не трогает существующих)"
+                echo -e "  2. ${YELLOW}Полностью пересоздать все 3 инбаунда с нуля (удалит текущие инбаунды и клиентов)${NC}"
+                echo "  0. Назад в главное меню"
+                echo ""
+                read -erp "Выберите действие [0-2]: " IB_CHOICE
+                case "$IB_CHOICE" in
+                    1) recreate_inbounds_exec "restore" ;;
+                    2)
+                        echo -e "${YELLOW}ВНИМАНИЕ: Все текущие инбаунды и клиенты в 3x-ui будут удалены!${NC}"
+                        read -erp "Продолжить? Введите YES для подтверждения: " IB_CONFIRM
+                        [[ "$IB_CONFIRM" == "YES" ]] && recreate_inbounds_exec "reset" || echo "Отменено."
+                        ;;
+                    0) break ;;
+                    *) echo -e "${RED}Неверный выбор.${NC}" ;;
+                esac
+            done
+            ;;
+    esac
+}
+
 clean_server() {
     echo -e "\n${RED}${BOLD}ВНИМАНИЕ! ПОЛНАЯ ОЧИСТКА СЕРВЕРА!${NC}"
     echo "Будут полностью удалены: 3x-ui, Xray, Nginx, CrowdSec, Fail2Ban, симлинки /root/cert,"
@@ -2871,7 +3280,9 @@ case "${1:-}" in
     5|blocklist) manage_blocklist "${2:-}" ;;
     6|whitelist) manage_whitelist "${2:-}" "${3:-}" ;;
     7|backup)    create_backup ;;
-    8|clean)     clean_server ;;
+    8|restore)   restore_backup "${2:-}" ;;
+    9|inbounds)  manage_inbounds "${2:-}" ;;
+    10|clean)    clean_server ;;
     *)
         while true; do
             echo -e "${BOLD}${CYAN}==================================================${NC}"
@@ -2884,10 +3295,12 @@ case "${1:-}" in
             echo "  5. Блокировка сканеров (установить / обновить / удалить C24Be + CyberOK)"
             echo "  6. Белый список IP (nftables + Fail2Ban)"
             echo "  7. Создать резервную копию конфигов и БД"
-            echo -e "  8. ${RED}Очистка сервера (полное удаление всех компонентов)${NC}"
+            echo "  8. Восстановить из резервной копии (БД / конфиги)"
+            echo "  9. Пересоздать / восстановить стандартные инбаунды 3x-ui"
+            echo -e "  10. ${RED}Очистка сервера (полное удаление всех компонентов)${NC}"
             echo "  0. Выход"
             echo ""
-            read -erp "Выберите пункт [0-8]: " CHOICE
+            read -erp "Выберите пункт [0-10]: " CHOICE
             case "$CHOICE" in
                 1) show_status ;;
                 2) show_sysinfo ;;
@@ -2896,7 +3309,9 @@ case "${1:-}" in
                 5) manage_blocklist ;;
                 6) manage_whitelist ;;
                 7) create_backup ;;
-                8) clean_server ;;
+                8) restore_backup ;;
+                9) manage_inbounds ;;
+                10) clean_server ;;
                 0) exit 0 ;;
                 *) echo -e "${RED}Неверный выбор.${NC}" ;;
             esac
@@ -2923,6 +3338,6 @@ echo -e "  • Fail2Ban:      активен (sshd + nginx-scanners + myfakesite
 echo -e "  • CrowdSec:      активен (crowdsec + nftables firewall bouncer)"
 echo -e "  • Блок сканеров: $([[ "$ENABLE_SCANNERS_BLOCK" =~ ^[Yy]$ ]] && echo 'C24Be + CyberOK Skipa (nftables prerouting drop)' || echo 'отключен (my3xui blocklist install)')"
 echo -e "  • Лог установки: ${LOG_FILE}"
-echo -e "  • CLI-утилита:   my3xui (status | info | creds | crowdsec | blocklist | whitelist | backup | clean)"
+echo -e "  • CLI-утилита:   my3xui (status | info | creds | crowdsec | blocklist | whitelist | backup | restore | inbounds | clean)"
 
 my3xui creds
