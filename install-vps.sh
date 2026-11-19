@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -eu
+set -euo pipefail
 
 # ============================================================================
 # Интерактивный установщик 3x-ui 3.11+ + Nginx HTTP/2 XHTTP + Security Stack
@@ -34,6 +34,39 @@ if [[ -f /etc/os-release ]]; then
 else
     log_err "Не удалось определить ОС (/etc/os-release не найден)."
 fi
+
+check_system_updates() {
+    log_info "Проверка наличия обновлений системы..."
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -qq
+    local upgradable_count
+    upgradable_count=$(apt-get -s upgrade 2>/dev/null | grep -c '^Inst ' || true)
+    if [[ "${upgradable_count}" -gt 0 ]]; then
+        log_warn "Доступно обновлений пакетов: ${upgradable_count}."
+        read -erp "Установить системные обновления перед началом установки? [Y/n]: " DO_UPGRADE
+        DO_UPGRADE=${DO_UPGRADE:-"Y"}
+        if [[ "$DO_UPGRADE" =~ ^[Yy]$ ]]; then
+            log_info "Установка обновлений системы..."
+            apt-get upgrade -y -qq -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold"
+            log_ok "Система успешно обновлена."
+            if [[ -f /var/run/reboot-required ]]; then
+                log_warn "Обновление затронуло ядро или системные библиотеки — рекомендуется перезагрузка."
+                read -erp "Перезагрузить сервер сейчас (после перезагрузки запустите скрипт снова)? [y/N]: " DO_REBOOT
+                if [[ "$DO_REBOOT" =~ ^[Yy]$ ]]; then
+                    log_info "Перезагрузка сервера..."
+                    reboot
+                    exit 0
+                fi
+            fi
+        else
+            log_info "Обновление системы пропущено."
+        fi
+    else
+        log_ok "Система актуальна, обновлений не требуется."
+    fi
+}
+
+check_system_updates
 
 # Предварительная проверка наличия python3, openssl и curl для генерации учётных данных
 if ! command -v python3 >/dev/null 2>&1 || ! command -v openssl >/dev/null 2>&1 || ! command -v curl >/dev/null 2>&1; then
@@ -74,33 +107,56 @@ read -erp "2. Введите Email для Let's Encrypt [admin@${DOMAIN}]: " LE_
 LE_EMAIL=${LE_EMAIL:-"admin@${DOMAIN}"}
 
 echo -e "\n3. Режим маскировки основного домена (${DOMAIN}):"
-printf "   ${BOLD}%-13s${NC} — %s\n" "[Enter] / 1" "«Облачный диск»: mock API и форма входа (рекомендуется)"
+printf "   ${BOLD}%-13s${NC} — %s\n" "[Enter] / 1" "«CloudDisk»: mock API и форма входа (рекомендуется)"
 printf "   ${BOLD}%-13s${NC} — %s\n" "2 / vapen"   "Портал облачного хранилища под вашим названием (S3: /s3, /api/v1/health)"
 printf "   ${BOLD}%-13s${NC} — %s\n" "[URL]"       "Reverse Proxy на другой сайт (например, https://example.org)"
-read -erp "   Ваш выбор [1]: " MASK_INPUT
-MASK_INPUT=$(echo "$MASK_INPUT" | tr -d '[:space:]')
 REVERSE_PROXY_URL=""
-case "${MASK_INPUT,,}" in
-    ""|1|disk)  MASK_MODE="disk";  MASK_LABEL="Локальный сайт облачного хранилища" ;;
-    2|vapen)    MASK_MODE="vapen"; MASK_LABEL="Локальный портал облачного хранилища" ;;
-    *)          MASK_MODE="proxy"; REVERSE_PROXY_URL="$MASK_INPUT"; MASK_LABEL="Reverse Proxy → ${MASK_INPUT}" ;;
-esac
+while true; do
+    read -erp "   Ваш выбор [1]: " MASK_INPUT
+    MASK_INPUT=$(echo "$MASK_INPUT" | tr -d '[:space:]')
+    case "${MASK_INPUT,,}" in
+        ""|1|disk)
+            MASK_MODE="disk"
+            break
+            ;;
+        2|vapen)
+            MASK_MODE="vapen"
+            break
+            ;;
+        http://*|https://*)
+            if [[ "$MASK_INPUT" =~ ^https?://[A-Za-z0-9.-]+(:[0-9]+)?(/.*)?$ ]]; then
+                MASK_MODE="proxy"
+                REVERSE_PROXY_URL="$MASK_INPUT"
+                MASK_LABEL="Reverse Proxy → ${MASK_INPUT}"
+                break
+            fi
+            echo -e "   ${RED}Некорректный URL. Укажите адрес вида https://example.org${NC}"
+            ;;
+        *)
+            echo -e "   ${RED}Неверный выбор. Введите 1, 2 или корректный URL (https://...).${NC}"
+            ;;
+    esac
+done
 
 COMPANY_NAME=""; COMPANY_SLUG="STORAGE"
 if [[ "$MASK_MODE" == "vapen" || "$MASK_MODE" == "disk" ]]; then
     COMPANY_RE='^[A-Za-z0-9][A-Za-z0-9 ._-]{1,31}$'
+    DEFAULT_CO=$( [[ "$MASK_MODE" == "vapen" ]] && echo "VAPEN" || echo "CloudDisk" )
     while true; do
-        DEFAULT_CO=$( [[ "$MASK_MODE" == "vapen" ]] && echo "VAPEN" || echo "Облачный диск" )
-    read -erp "   Название компании для сайта (например, Nimbus Labs) [${DEFAULT_CO}]: " COMPANY_NAME
+        read -erp "   Название компании на английском (например, Nimbus Labs) [${DEFAULT_CO}]: " COMPANY_NAME
         COMPANY_NAME=$(echo "$COMPANY_NAME" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
         COMPANY_NAME=$(echo "$COMPANY_NAME" | sed -E 's/[[:space:]]+[Cc]loud[[:space:]]+[Ss]torage$//')  # суффикс добавляется автоматически
         COMPANY_NAME=${COMPANY_NAME:-${DEFAULT_CO}}
         [[ "$COMPANY_NAME" =~ $COMPANY_RE ]] && break
-        echo -e "   ${RED}Допустимы латинские буквы, цифры, пробел и символы . _ - (от 2 до 32 символов).${NC}"
+        echo -e "   ${RED}Только английский (латиница), цифры, пробел и символы . _ - (от 2 до 32 символов).${NC}"
     done
     COMPANY_SLUG=$(echo "$COMPANY_NAME" | tr -cd 'A-Za-z0-9' | tr 'a-z' 'A-Z' | cut -c1-16)
     COMPANY_SLUG=${COMPANY_SLUG:-STORAGE}
-    MASK_LABEL="Локальный портал «${COMPANY_NAME} Cloud Storage»"
+    if [[ "$MASK_MODE" == "vapen" ]]; then
+        MASK_LABEL="Локальный портал «${COMPANY_NAME} Cloud Storage»"
+    else
+        MASK_LABEL="Локальный сайт «${COMPANY_NAME}» (mock API)"
+    fi
 fi
 
 # Генерация сложных случайных логина (12 симв.) и пароля (20 симв. со спецсимволами)
@@ -160,7 +216,7 @@ echo "  • Порт подписки:  127.0.0.1:${SUB_PORT} (путь /${SUB_P
 echo "  • Логин панели:   ${PANEL_USER}"
 echo "  • Безопасность:   UFW (SSH:${SSH_PORT}, 80, 443) + Fail2Ban + CrowdSec"
 echo "  • Блок сканеров:  $([[ "$ENABLE_SCANNERS_BLOCK" =~ ^[Yy]$ ]] && echo 'C24Be + CyberOK Skipa (nftables)' || echo 'Отключено (доступно в my3xui)')"
-echo "  • CLI-утилита:    my3xui (info, creds, crowdsec, blocklist, clean)"
+echo "  • CLI-утилита:    my3xui (status, info, creds, crowdsec, blocklist, whitelist, backup, clean)"
 echo ""
 read -erp "Начать установку? [Y/n]: " START_CONFIRM
 [[ "$START_CONFIRM" =~ ^[Nn]$ ]] && exit 0
@@ -239,13 +295,27 @@ if [[ -n "$ACTIVE_SSH_PORT" && "$ACTIVE_SSH_PORT" != "$SSH_PORT" ]]; then
 fi
 ufw allow 80/tcp comment 'HTTP ACME' >/dev/null
 ufw allow 443/tcp comment 'HTTPS Proxy' >/dev/null
-ufw allow 443/udp comment 'QUIC / HTTP3' >/dev/null
 ufw --force enable >/dev/null
 log_ok "UFW активирован."
 
 # 6. Выпуск SSL-сертификата Let's Encrypt и настройка webroot для автопродления без остановки Nginx
 log_info "Получение SSL-сертификата для ${DOMAIN}..."
-systemctl stop nginx || true
+systemctl stop nginx >/dev/null 2>&1 || true
+BUSY_PORTS=$(ss -tlnp 2>/dev/null | grep -E ':(80|443)[[:space:]]' || true)
+if [[ -n "$BUSY_PORTS" ]]; then
+    log_warn "Порты 80 или 443 заняты другим процессом:\n${BUSY_PORTS}"
+    if systemctl is-active --quiet apache2 2>/dev/null; then
+        read -erp "Обнаружен работающий apache2. Остановить и отключить его? [Y/n]: " STOP_APACHE
+        STOP_APACHE=${STOP_APACHE:-"Y"}
+        if [[ "$STOP_APACHE" =~ ^[Yy]$ ]]; then
+            systemctl disable --now apache2 >/dev/null 2>&1 || true
+            log_ok "apache2 остановлен и отключён."
+        fi
+    else
+        read -erp "Certbot не сможет выпустить сертификат при занятом порте 80. Продолжить? [y/N]: " PORT_CONT
+        [[ ! "$PORT_CONT" =~ ^[Yy]$ ]] && exit 1
+    fi
+fi
 mkdir -p "/root/cert/${DOMAIN}" /var/www/html
 
 if [[ ! -f "/etc/letsencrypt/live/${DOMAIN}/fullchain.pem" ]]; then
@@ -1009,7 +1079,15 @@ FS_VAPEN_ERR_EOF
             add_header x-amz-bucket-region "eu-central-1" always;
             add_header Strict-Transport-Security "max-age=31536000; includeSubDomains; preload" always;
             add_header X-Content-Type-Options "nosniff" always;
-            return 403 '<?xml version="1.0" encoding="UTF-8"?>\n<Error>\n  <Code>AccessDenied</Code>\n  <Message>Access Denied. Unsigned request or missing AWS4-HMAC-SHA256 authorization header.</Message>\n  <Resource>/s3$s3path</Resource>\n  <RequestId>$request_id</RequestId>\n  <HostId>MzRISOwyjmnup+$request_id/@@SLUG@@-S3-FRA01</HostId>\n</Error>\n';
+            return 403 '<?xml version="1.0" encoding="UTF-8"?>
+<Error>
+  <Code>AccessDenied</Code>
+  <Message>Access Denied. Unsigned request or missing AWS4-HMAC-SHA256 authorization header.</Message>
+  <Resource>/s3$s3path</Resource>
+  <RequestId>$request_id</RequestId>
+  <HostId>MzRISOwyjmnup+$request_id/@@SLUG@@-S3-FRA01</HostId>
+</Error>
+';
         }
 
         # Эмуляция JSON-эндпоинта статуса узла
@@ -1021,7 +1099,7 @@ FS_VAPEN_ERR_EOF
             add_header X-S3-Storage-Node "VLT-FRA-01" always;
             add_header Strict-Transport-Security "max-age=31536000; includeSubDomains; preload" always;
             add_header X-Content-Type-Options "nosniff" always;
-            return 200 '{"status":"healthy","service":"@@COMPANY@@ Cloud Storage S3 Gateway","version":"4.2.1-enterprise","node_id":"VLT-FRA-01","region":"eu-central-1","storage_engine":"nvme-erasure-coding-v4","replication":"synced","tls_protocol":"$ssl_protocol","timestamp":"$time_iso8601","request_id":"$request_id"}\n';
+            return 200 '{"status":"healthy","service":"@@COMPANY@@ Cloud Storage S3 Gateway","version":"4.2.1-enterprise","node_id":"VLT-FRA-01","region":"eu-central-1","storage_engine":"nvme-erasure-coding-v4","replication":"synced","tls_protocol":"$ssl_protocol","timestamp":"$time_iso8601","request_id":"$request_id"}';
         }
 
         # Страница WAF-ошибки портала (только для внутренних редиректов)
@@ -1710,7 +1788,6 @@ http {
         ssl_session_timeout 15m;
         ssl_early_data on;
         ssl_stapling off;
-        proxy_set_header Early-Data \$ssl_early_data;
 
         add_header X-Frame-Options "DENY" always;
         add_header X-Content-Type-Options "nosniff" always;
@@ -1892,6 +1969,7 @@ EOF
 
 cat <<EOF > /etc/fail2ban/jail.local
 [DEFAULT]
+ignoreip = 127.0.0.1/8 ::1${ADMIN_SSH_IP:+ ${ADMIN_SSH_IP}}
 bantime = 24h
 findtime = 10m
 maxretry = 3
@@ -1961,13 +2039,26 @@ labels:
 EOF
 fi
 
-cscli bouncers delete firewall-bouncer >/dev/null 2>&1 || true
+# Запускаем CrowdSec LAPI до регистрации баунсера, чтобы избежать гонки запуска
+systemctl enable --now crowdsec
+for _ in $(seq 1 10); do
+    cscli bouncers list >/dev/null 2>&1 && break
+    sleep 1
+done
+
+# Удаляем автосозданные и старые firewall-баунсеры, чтобы не оставлять дубликаты
+for OLD_B in $(cscli bouncers list -o json 2>/dev/null | jq -r '.[].name // empty' 2>/dev/null || true); do
+    if [[ "$OLD_B" == "firewall-bouncer" || "$OLD_B" == cs-firewall-bouncer* ]]; then
+        cscli bouncers delete "$OLD_B" >/dev/null 2>&1 || true
+    fi
+done
+
 BOUNCER_KEY=$(cscli bouncers add firewall-bouncer -o raw)
 rm -f /etc/crowdsec/bouncers/crowdsec-firewall-bouncer.yaml.local
 sed -i "s|^api_key:.*|api_key: ${BOUNCER_KEY}|" /etc/crowdsec/bouncers/crowdsec-firewall-bouncer.yaml
 sed -i "s|^mode:.*|mode: nftables|" /etc/crowdsec/bouncers/crowdsec-firewall-bouncer.yaml
 
-systemctl enable --now crowdsec crowdsec-firewall-bouncer
+systemctl enable --now crowdsec-firewall-bouncer
 systemctl restart crowdsec crowdsec-firewall-bouncer
 
 # 13. Подготовка генератора объединённой блокировки C24Be + CyberOK Skipa в nftables (с защитой SSH и белым списком IP)
@@ -2123,7 +2214,7 @@ fi
 log_info "Установка CLI-утилиты управления my3xui..."
 cat <<'EOF' > /usr/local/bin/my3xui
 #!/usr/bin/env bash
-set -eu
+set -euo pipefail
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -2133,6 +2224,40 @@ BOLD='\033[1m'
 NC='\033[0m'
 
 [[ $EUID -ne 0 ]] && { echo -e "${RED}Запустите команду от имени root: sudo my3xui${NC}"; exit 1; }
+
+show_status() {
+    echo -e "\n${BOLD}${CYAN}=== СТАТУС СЕРВИСОВ И SSL ===${NC}"
+    for svc in x-ui nginx fail2ban crowdsec crowdsec-firewall-bouncer scanners-blocklist; do
+        if systemctl is-active --quiet "$svc" 2>/dev/null; then
+            printf "  • %-28s ${GREEN}active${NC}\n" "${svc}:"
+        elif systemctl list-unit-files "${svc}.service" >/dev/null 2>&1; then
+            printf "  • %-28s ${YELLOW}inactive${NC}\n" "${svc}:"
+        else
+            printf "  • %-28s ${RED}not installed${NC}\n" "${svc}:"
+        fi
+    done
+
+    CERT_FILE=$(find /root/cert -maxdepth 2 -name fullchain.pem 2>/dev/null | head -n 1 || true)
+    if [[ -n "$CERT_FILE" && -f "$CERT_FILE" ]]; then
+        EXP_DATE=$(openssl x509 -enddate -noout -in "$CERT_FILE" 2>/dev/null | cut -d= -f2 || true)
+        if [[ -n "$EXP_DATE" ]]; then
+            EXP_EPOCH=$(date -d "$EXP_DATE" +%s 2>/dev/null || echo 0)
+            NOW_EPOCH=$(date +%s)
+            DAYS_LEFT=$(( (EXP_EPOCH - NOW_EPOCH) / 86400 ))
+            if [[ "$DAYS_LEFT" -le 14 ]]; then
+                COLOR="$RED"
+            elif [[ "$DAYS_LEFT" -le 30 ]]; then
+                COLOR="$YELLOW"
+            else
+                COLOR="$GREEN"
+            fi
+            echo -e "  • ${BOLD}SSL-сертификат:${NC}             ${COLOR}осталось ${DAYS_LEFT} дн.${NC} (до ${EXP_DATE})"
+        fi
+    else
+        echo -e "  • ${BOLD}SSL-сертификат:${NC}             ${YELLOW}не найден в /root/cert${NC}"
+    fi
+    echo ""
+}
 
 show_sysinfo() {
     echo -e "\n${BOLD}${CYAN}=== ИНФОРМАЦИЯ О СИСТЕМЕ ===${NC}"
@@ -2148,10 +2273,12 @@ show_sysinfo() {
 
     MEM_INFO=$(free -h | awk '/^Mem:/ {print $3 " / " $2 " (доступно: " $7 ")"}')
     SWAP_INFO=$(free -h | awk '/^Swap:/ {print $3 " / " $2}')
+    ROOT_USAGE=$(df -h / | awk 'NR==2 {print $3 " / " $2 " (" $5 ")"}')
 
     echo -e "  • ${BOLD}Процессор:${NC}      ${CPU_MODEL:-Unknown} (${CPU_CORES} vCPU @ ${CPU_FREQ})"
     echo -e "  • ${BOLD}Оперативная пам.:${NC} ${MEM_INFO}"
     echo -e "  • ${BOLD}Swap:${NC}           ${SWAP_INFO}"
+    echo -e "  • ${BOLD}Корень (/):${NC}     ${ROOT_USAGE}"
     echo -e "  • ${BOLD}Диски:${NC}"
     lsblk -d -n -o NAME,SIZE | while read -r DEV_NAME DEV_SIZE; do
         [[ -z "$DEV_NAME" || "$DEV_NAME" =~ ^(loop|ram|sr|fd|zram) ]] && continue
@@ -2171,8 +2298,12 @@ show_sysinfo() {
         fi
         [[ -n "$MODEL" ]] && DISK_TYPE="${DISK_TYPE} (${MODEL})"
 
-        MOUNT_USAGE=$(df -h / | awk 'NR==2 {print $3 " / " $2 " (" $5 ")"}')
-        echo -e "      - /dev/${DEV_NAME}: ${BOLD}${DEV_SIZE}${NC} [${DISK_TYPE}] — занято на /: ${MOUNT_USAGE}"
+        MOUNTS=$(lsblk -ln -o MOUNTPOINT "/dev/${DEV_NAME}" 2>/dev/null | awk 'NF && $1 != "[SWAP]"' | paste -sd, - || true)
+        if [[ -n "$MOUNTS" ]]; then
+            echo -e "      - /dev/${DEV_NAME}: ${BOLD}${DEV_SIZE}${NC} [${DISK_TYPE}] — точки монтирования: ${MOUNTS}"
+        else
+            echo -e "      - /dev/${DEV_NAME}: ${BOLD}${DEV_SIZE}${NC} [${DISK_TYPE}]"
+        fi
     done
     echo ""
 }
@@ -2230,6 +2361,108 @@ for remark, port, tag in cur.execute("SELECT remark, port, tag FROM inbounds WHE
 conn.close()
 DBEOF
     echo ""
+}
+
+sync_f2b_whitelist() {
+    local wl_file="/etc/nftables.d/whitelist_ips.txt"
+    local jail_file="/etc/fail2ban/jail.local"
+    [[ ! -f "$jail_file" ]] && return 0
+    local ips=""
+    if [[ -f "$wl_file" ]]; then
+        ips=$(grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}' "$wl_file" | sort -u | paste -sd' ' - || true)
+    fi
+    local ignore_line="ignoreip = 127.0.0.1/8 ::1${ips:+ ${ips}}"
+    if grep -q '^ignoreip =' "$jail_file"; then
+        sed -i "s|^ignoreip =.*|${ignore_line}|" "$jail_file"
+    else
+        sed -i "/^\[DEFAULT\]/a ${ignore_line}" "$jail_file"
+    fi
+    systemctl reload fail2ban >/dev/null 2>&1 || systemctl restart fail2ban >/dev/null 2>&1 || true
+}
+
+manage_whitelist() {
+    local wl_file="/etc/nftables.d/whitelist_ips.txt"
+    mkdir -p /etc/nftables.d
+    touch "$wl_file"
+    local action="${1:-}"
+    local target_ip="${2:-}"
+
+    case "$action" in
+        list)
+            echo -e "\n${BOLD}${CYAN}=== БЕЛЫЙ СПИСОК IP (nftables + Fail2Ban) ===${NC}"
+            if [[ -s "$wl_file" ]]; then
+                nl -ba "$wl_file"
+            else
+                echo "  Список пуст."
+            fi
+            echo ""
+            ;;
+        add)
+            [[ -z "$target_ip" ]] && read -erp "Введите IPv4 для добавления в белый список: " target_ip
+            if ! [[ "$target_ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+                echo -e "${RED}Некорректный IPv4-адрес.${NC}"
+                return 1
+            fi
+            echo "$target_ip" >> "$wl_file"
+            sort -u "$wl_file" -o "$wl_file"
+            sync_f2b_whitelist
+            if /usr/sbin/nft list table inet scanners_block &>/dev/null; then
+                /usr/local/sbin/update-scanners-blocklist.sh >/dev/null 2>&1 || true
+            fi
+            echo -e "${GREEN}[OK] IP ${target_ip} добавлен в белый список (nftables + Fail2Ban).${NC}"
+            ;;
+        del|remove)
+            [[ -z "$target_ip" ]] && read -erp "Введите IPv4 для удаления из белого списка: " target_ip
+            grep -vxF "$target_ip" "$wl_file" > "${wl_file}.tmp" || true
+            mv "${wl_file}.tmp" "$wl_file"
+            sync_f2b_whitelist
+            if /usr/sbin/nft list table inet scanners_block &>/dev/null; then
+                /usr/local/sbin/update-scanners-blocklist.sh >/dev/null 2>&1 || true
+            fi
+            echo -e "${GREEN}[OK] IP ${target_ip} удалён из белого списка.${NC}"
+            ;;
+        *)
+            while true; do
+                echo -e "\n${BOLD}${CYAN}=== БЕЛЫЙ СПИСОК IP (nftables + Fail2Ban) ===${NC}"
+                if [[ -s "$wl_file" ]]; then
+                    sed 's/^/  • /' "$wl_file"
+                else
+                    echo "  (пусто)"
+                fi
+                echo ""
+                echo "  1. Добавить IPv4 в белый список"
+                echo "  2. Удалить IPv4 из белого списка"
+                echo "  0. Назад в главное меню"
+                echo ""
+                read -erp "Выберите действие [0-2]: " WL_CHOICE
+                case "$WL_CHOICE" in
+                    1) manage_whitelist add ;;
+                    2) manage_whitelist del ;;
+                    0) break ;;
+                    *) echo -e "${RED}Неверный выбор.${NC}" ;;
+                esac
+            done
+            ;;
+    esac
+}
+
+create_backup() {
+    local bdir="/root/backups"
+    local ts
+    ts=$(date +%Y%m%d-%H%M%S)
+    local archive="${bdir}/my3xui-backup-${ts}.tar.gz"
+    mkdir -p "$bdir"
+    local files=()
+    for f in /etc/x-ui/x-ui.db /etc/nginx/nginx.conf /etc/fail2ban/jail.local /etc/nftables.d/whitelist_ips.txt /root/vps-credentials.txt; do
+        [[ -f "$f" ]] && files+=("$f")
+    done
+    if [[ ${#files[@]} -eq 0 ]]; then
+        echo -e "${YELLOW}Файлы для резервного копирования не найдены.${NC}"
+        return 1
+    fi
+    tar -czf "$archive" "${files[@]}" 2>/dev/null
+    chmod 600 "$archive"
+    echo -e "${GREEN}[OK] Бэкап создан: ${archive}${NC}"
 }
 
 blocklist_status() {
@@ -2327,10 +2560,12 @@ show_crowdsec() {
 
 clean_server() {
     echo -e "\n${RED}${BOLD}ВНИМАНИЕ! ПОЛНАЯ ОЧИСТКА СЕРВЕРА!${NC}"
-    echo "Будут полностью удалены: 3x-ui, Xray, Nginx, CrowdSec, Fail2Ban, сертификаты,"
+    echo "Будут полностью удалены: 3x-ui, Xray, Nginx, CrowdSec, Fail2Ban, симлинки /root/cert,"
     echo "веб-заглушка, sysctl-тюнинг, правила nftables/UFW, cron-задачи и команда my3xui."
+    echo "(Сертификаты в /etc/letsencrypt по умолчанию сохраняются, чтобы не упереться в лимиты LE.)"
     read -erp "Вы уверены? Введите YES для подтверждения: " CONFIRM1
     [[ "$CONFIRM1" != "YES" ]] && { echo "Отменено."; return; }
+    read -erp "Удалить также сертификаты Let's Encrypt (/etc/letsencrypt)? [y/N]: " DEL_LE
 
     echo -e "${YELLOW}[1/6] Остановка и удаление 3x-ui...${NC}"
     systemctl stop x-ui 2>/dev/null || true
@@ -2369,6 +2604,9 @@ clean_server() {
     echo -e "${YELLOW}[5/6] Удаление сертификатов, sysctl-тюнинга и логов установки...${NC}"
     rm -rf /root/cert /etc/letsencrypt/renewal-hooks/deploy/reload-services.sh \
            /etc/sysctl.d/99-xray-custom.conf /root/vps-credentials.txt
+    if [[ "${DEL_LE:-}" =~ ^[Yy]$ ]]; then
+        rm -rf /etc/letsencrypt
+    fi
     sysctl --system >/dev/null 2>&1 || true
     apt-get autoremove -y -qq >/dev/null 2>&1 || true
     systemctl daemon-reload
@@ -2380,30 +2618,39 @@ clean_server() {
 }
 
 case "${1:-}" in
-    1|info)      show_sysinfo ;;
-    2|creds)     show_creds ;;
-    3|crowdsec)  show_crowdsec ;;
-    4|blocklist) manage_blocklist "${2:-}" ;;
-    5|clean)     clean_server ;;
+    1|status)    show_status ;;
+    2|info)      show_sysinfo ;;
+    3|creds)     show_creds ;;
+    4|crowdsec)  show_crowdsec ;;
+    5|blocklist) manage_blocklist "${2:-}" ;;
+    6|whitelist) manage_whitelist "${2:-}" "${3:-}" ;;
+    7|backup)    create_backup ;;
+    8|clean)     clean_server ;;
     *)
         while true; do
             echo -e "${BOLD}${CYAN}==================================================${NC}"
             echo -e "${BOLD}   Управление сервером (my3xui CLI)               ${NC}"
             echo -e "${BOLD}${CYAN}==================================================${NC}"
-            echo "  1. Информация о системе (CPU, RAM, тип и размер дисков)"
-            echo "  2. Данные для входа в панель 3x-ui"
-            echo "  3. Состояние CrowdSec и активных блокировок"
-            echo "  4. Блокировка сканеров (установить / обновить / удалить C24Be + CyberOK)"
-            echo -e "  5. ${RED}Очистка сервера (полное удаление всех компонентов)${NC}"
+            echo "  1. Статус сервисов и SSL-сертификата"
+            echo "  2. Информация о системе (CPU, RAM, тип и размер дисков)"
+            echo "  3. Данные для входа в панель 3x-ui"
+            echo "  4. Состояние CrowdSec и активных блокировок"
+            echo "  5. Блокировка сканеров (установить / обновить / удалить C24Be + CyberOK)"
+            echo "  6. Белый список IP (nftables + Fail2Ban)"
+            echo "  7. Создать резервную копию конфигов и БД"
+            echo -e "  8. ${RED}Очистка сервера (полное удаление всех компонентов)${NC}"
             echo "  0. Выход"
             echo ""
-            read -erp "Выберите пункт [0-5]: " CHOICE
+            read -erp "Выберите пункт [0-8]: " CHOICE
             case "$CHOICE" in
-                1) show_sysinfo ;;
-                2) show_creds ;;
-                3) show_crowdsec ;;
-                4) manage_blocklist ;;
-                5) clean_server ;;
+                1) show_status ;;
+                2) show_sysinfo ;;
+                3) show_creds ;;
+                4) show_crowdsec ;;
+                5) manage_blocklist ;;
+                6) manage_whitelist ;;
+                7) create_backup ;;
+                8) clean_server ;;
                 0) exit 0 ;;
                 *) echo -e "${RED}Неверный выбор.${NC}" ;;
             esac
@@ -2412,7 +2659,6 @@ case "${1:-}" in
 esac
 EOF
 chmod +x /usr/local/bin/my3xui
-
 # 15. Сохранение резервной копии учетных данных и финальный вывод (без пользователей и ссылок подписки)
 INFO_FILE="/root/vps-credentials.txt"
 printf "Ссылка на панель 3x-ui:  https://%s/%s/\nЛогин:                   %s\nПароль:                  %s\n" \
@@ -2430,6 +2676,6 @@ echo -e "  • UFW:           активен (открыты только SSH:${
 echo -e "  • Fail2Ban:      активен (sshd + nginx-scanners + myfakesite-auth через nftables)"
 echo -e "  • CrowdSec:      активен (crowdsec + nftables firewall bouncer)"
 echo -e "  • Блок сканеров: $([[ "$ENABLE_SCANNERS_BLOCK" =~ ^[Yy]$ ]] && echo 'C24Be + CyberOK Skipa (nftables prerouting drop)' || echo 'отключен (my3xui blocklist install)')"
-echo -e "  • CLI-утилита:   my3xui (info | creds | crowdsec | blocklist | clean)"
+echo -e "  • CLI-утилита:   my3xui (status | info | creds | crowdsec | blocklist | whitelist | backup | clean)"
 
 my3xui creds
